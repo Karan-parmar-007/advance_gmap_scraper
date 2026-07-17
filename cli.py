@@ -17,7 +17,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--state", action="append", default=[], help="State name or abbr (repeatable)")
     p.add_argument("--city", action="append", default=[], help="City (repeatable)")
     p.add_argument("--limit", type=int, default=50, help="Total companies (0 = no limit)")
-    p.add_argument("--per-zip", type=int, default=20, help="Max results kept per ZIP")
+    p.add_argument(
+        "--per-zip",
+        type=int,
+        default=20,
+        help=(
+            "Target unique companies per ZIP (paginates in pages of 20 until met, "
+            "exhausted, or no new results)"
+        ),
+    )
     p.add_argument("--delay-min", type=float, default=2.0)
     p.add_argument("--delay-max", type=float, default=6.0)
     p.add_argument("--proxy", action="append", default=[], help="Proxy URL (repeatable)")

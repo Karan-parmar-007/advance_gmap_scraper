@@ -10,10 +10,14 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT_DIR / "data"
 OUTPUT_DIR = ROOT_DIR / "output"
 DEBUG_DIR = ROOT_DIR / "debug"
-ZIP_EXCEL_PATH = DATA_DIR / "All Segment Zip Combinations.xlsx"
+LOCATION_JSON_PATH = DATA_DIR / "location_pincodes.json"
 
 # Defaults
 DEFAULT_PER_ZIP_CAP = 20
+PAGE_SIZE = 20
+MAX_PAGES_PER_ZIP = 10
+INTRA_ZIP_DELAY_MIN = 1.0
+INTRA_ZIP_DELAY_MAX = 3.0
 DEFAULT_DELAY_MIN = 2.0
 DEFAULT_DELAY_MAX = 6.0
 DEFAULT_HL = "en"
@@ -56,7 +60,7 @@ DEFAULT_SPAN = 50_000.0  # meters viewport span
 # Most feature flags are kept verbatim so Google returns the same rich payload.
 PB_TEMPLATE = (
     "!4m12!1m3!1d{span}!2d{lng}!3d{lat}"
-    "!2m3!1f0!2f0!3f0!3m2!1i1024!2i768!4f13.1!7i20!10b1"
+    "!2m3!1f0!2f0!3f0!3m2!1i1024!2i768!4f13.1!7i20!8i{offset}!10b1"
     "!12m26!1m5!18b1!30b1!31m1!1b1!34e1!2m4!5m1!6e2!20e3!39b1"
     "!10b1!12b1!13b1!16b1!17m1!3e1!20m4!5e2!6b1!8b1!14b1!46m1!1b0"
     "!96b1!99b1!19m4!2m3!1i360!2i120!4i8"
@@ -87,8 +91,13 @@ PB_TEMPLATE = (
 GMAPS_SEARCH_URL = "https://www.google.com/search"
 
 
-def build_pb(lat: float = DEFAULT_LAT, lng: float = DEFAULT_LNG, span: float = DEFAULT_SPAN) -> str:
-    return PB_TEMPLATE.format(span=span, lng=lng, lat=lat)
+def build_pb(
+    lat: float = DEFAULT_LAT,
+    lng: float = DEFAULT_LNG,
+    span: float = DEFAULT_SPAN,
+    offset: int = 0,
+) -> str:
+    return PB_TEMPLATE.format(span=span, lng=lng, lat=lat, offset=max(0, int(offset)))
 
 
 def random_delay(min_s: float = DEFAULT_DELAY_MIN, max_s: float = DEFAULT_DELAY_MAX) -> float:

@@ -12,7 +12,9 @@ from scraper.config import (
     DEFAULT_DELAY_MAX,
     DEFAULT_DELAY_MIN,
     DEFAULT_PER_ZIP_CAP,
+    MAX_PAGES_PER_ZIP,
     OUTPUT_DIR,
+    PAGE_SIZE,
     ensure_dirs,
 )
 from scraper.locations import list_cities, list_countries, list_states
@@ -22,7 +24,7 @@ st.set_page_config(page_title="Maps Company Scraper", page_icon="📍", layout="
 ensure_dirs()
 
 st.title("Google Maps Company Scraper")
-st.caption("Query Google Maps by ZIP from your location DB — no browser automation.")
+st.caption("Query Google Maps by ZIP/pincode from location_pincodes.json — no browser automation.")
 
 # Session state
 if "stop_flag" not in st.session_state:
@@ -64,11 +66,15 @@ with st.sidebar:
         help="Stop once this many unique companies are collected.",
     )
     per_zip_cap = st.number_input(
-        "Max per ZIP (first request only)",
+        "Results per ZIP",
         min_value=1,
-        max_value=50,
+        max_value=PAGE_SIZE * MAX_PAGES_PER_ZIP,
         value=DEFAULT_PER_ZIP_CAP,
-        help="If the first response returns this many, move to the next ZIP (no pagination).",
+        help=(
+            "How many unique companies to collect from each ZIP. "
+            "Requests 20 results per page and paginates until this target is met, "
+            "results are exhausted, or no new companies appear."
+        ),
     )
 
     st.subheader("Request pacing")

@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE settings
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Output files
+output/
+data/results*.csv
+data/results*.json
+
+# Debug / test files
+debug/
+*.log
+live_raw.txt
+
+# Environment variables & secrets
+.env
+.env.local
+.env.production
+*.key
+*.pem
+*.cert
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Node / package manager (if ever used)
+node_modules/
+package-lock.json
+yarn.lock
+
+# Jupyter notebooks (optional, uncomment if needed)
+# .ipynb_checkpoints/
+
+# OSINT / scraping specific
+proxies.txt
+proxy_list.txt
+api_keys.json
+credentials.json
+secrets.json

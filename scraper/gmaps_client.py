@@ -45,9 +45,20 @@ class GMapsClient:
         self.session = requests.Session()
         self.session.headers.update(DEFAULT_HEADERS)
         self.session.cookies.update(DEFAULT_COOKIES)
+        self._zip_psi: str | None = None
+        self._zip_ech = 0
 
     def close(self) -> None:
         self.session.close()
+
+    def begin_zip_session(self) -> None:
+        """Start a new Maps session for paginated requests within one ZIP."""
+        self._zip_psi = self._make_psi()
+        self._zip_ech = 0
+
+    def end_zip_session(self) -> None:
+        self._zip_psi = None
+        self._zip_ech = 0
 
     def search(
         self,
@@ -56,22 +67,34 @@ class GMapsClient:
         lat: float = DEFAULT_LAT,
         lng: float = DEFAULT_LNG,
         span: float = DEFAULT_SPAN,
+        offset: int = 0,
+        use_zip_session: bool = False,
     ) -> str:
         """
         Perform a Maps search and return raw response text.
         Raises BlockedError / requests.HTTPError on failure after retries.
         """
+        if use_zip_session:
+            if not self._zip_psi:
+                self.begin_zip_session()
+            self._zip_ech += 1
+            psi = self._zip_psi
+            ech = self._zip_ech
+        else:
+            psi = self._make_psi()
+            ech = 1
+
         params = {
             "tbm": "map",
             "authuser": "0",
             "hl": self.hl,
             "gl": self.gl,
-            "pb": build_pb(lat=lat, lng=lng, span=span),
+            "pb": build_pb(lat=lat, lng=lng, span=span, offset=offset),
             "q": query,
             "oq": query,
             "tch": "1",
-            "ech": "1",
-            "psi": self._make_psi(),
+            "ech": str(ech),
+            "psi": psi,
         }
 
         last_err: Exception | None = None
@@ -167,7 +190,7 @@ class GMapsClient:
             "tbm": "map",
             "hl": self.hl,
             "gl": self.gl,
-            "pb": build_pb(lat=lat, lng=lng),
+            "pb": build_pb(lat=lat, lng=lng, offset=0),
             "q": query,
             "tch": "1",
         }
