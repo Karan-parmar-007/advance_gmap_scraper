@@ -6,8 +6,11 @@ HTTP scraper for Google Maps local results (no browser). Searches by ZIP/pincode
 
 - Search by term + country / state(s) / city(cities)
 - Always queries as `{term} {zip}` against random matching ZIPs
+- When a total limit is set, it is divided evenly across selected countries, then states, then cities (city split only if each city would get at least 20)
+- Runs selected states concurrently (configurable with `--max-parallel`)
 - Paginates within each ZIP (`!8i{offset}` in `pb`) — 20 results per page, up to your per-ZIP target (default 20)
-- Stops a ZIP early when results are exhausted, all dupes, or the target is reached; then moves to the next ZIP
+- If a location misses its quota, deep-scans every ZIP up to 10 pages each
+- Transfers any remaining shortfall to selected pipelines that still have capacity
 - Dedupes by Maps place id / name+phone
 - Extracts: name, phone, website, rating, reviews (when present), address, categories, lat/lng, place id
 - Proxy-ready (`ProxyManager`) for residential rotation later
@@ -30,6 +33,7 @@ streamlit run app.py
 python cli.py plumber --state Illinois --city Chicago --limit 50
 python cli.py "web design" --state TX --limit 100 --per-zip 60
 python cli.py plumber --country "United States" --limit 200
+python cli.py "it companies" --state Illinois --state Massachusetts --limit 600 --max-parallel 2
 ```
 
 ## Project layout
@@ -42,7 +46,8 @@ scraper/
   gmaps_client.py      # HTTP client (tbm=map)
   parser.py            # Unwrap + extract companies
   locations.py         # JSON pincode pool filters
-  runner.py            # Zip loop + limits + export
+  quotas.py            # Hierarchical limit distribution
+  runner.py            # Unit/zip loop + limits + export
   proxy_manager.py     # Direct now; rotation later
   models.py / dedupe.py
 data/                  # location_pincodes.json

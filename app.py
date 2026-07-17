@@ -1,9 +1,9 @@
-"""Streamlit UI for the Google Maps company scraper."""
+"""Streamlit dashboard for the concurrent Google Maps company scraper."""
 
 from __future__ import annotations
 
 import time
-from pathlib import Path
+from io import BytesIO
 
 import pandas as pd
 import streamlit as st
@@ -13,132 +13,276 @@ from scraper.config import (
     DEFAULT_DELAY_MIN,
     DEFAULT_PER_ZIP_CAP,
     MAX_PAGES_PER_ZIP,
-    OUTPUT_DIR,
     PAGE_SIZE,
     ensure_dirs,
 )
 from scraper.locations import list_cities, list_countries, list_states
 from scraper.runner import ScraperRunner
 
-st.set_page_config(page_title="Maps Company Scraper", page_icon="📍", layout="wide")
+
+st.set_page_config(
+    page_title="Maps company scraper",
+    page_icon=":material/travel_explore:",
+    layout="wide",
+)
 ensure_dirs()
 
-st.title("Google Maps Company Scraper")
-st.caption("Query Google Maps by ZIP/pincode from location_pincodes.json — no browser automation.")
-
-# Session state
-if "stop_flag" not in st.session_state:
-    st.session_state.stop_flag = False
-if "running" not in st.session_state:
-    st.session_state.running = False
-if "results" not in st.session_state:
-    st.session_state.results = []
-if "progress" not in st.session_state:
-    st.session_state.progress = {}
-if "logs" not in st.session_state:
-    st.session_state.logs = []
+st.session_state.setdefault("running", False)
+st.session_state.setdefault("results", [])
+st.session_state.setdefault("progress", {})
+st.session_state.setdefault("logs", [])
 
 
 def companies_to_df(companies: list) -> pd.DataFrame:
     if not companies:
         return pd.DataFrame()
     if hasattr(companies[0], "to_dict"):
-        return pd.DataFrame([c.to_dict() for c in companies])
+        return pd.DataFrame([company.to_dict() for company in companies])
     return pd.DataFrame(companies)
 
 
+def pipelines_to_df(pipelines: list[dict]) -> pd.DataFrame:
+    rows = []
+    for pipeline in pipelines:
+        target = int(pipeline.get("target") or 0)
+        collected = int(pipeline.get("collected") or 0)
+        progress = min(100, round((collected / target) * 100)) if target else 0
+        deep_locations = sum(
+            1 for location in pipeline.get("locations", []) if location.get("deep_scan")
+        )
+        rows.append(
+            {
+                "Pipeline": pipeline.get("label"),
+                "Status": pipeline.get("status"),
+                "Target": target or "Unlimited",
+                "Collected": collected,
+                "Progress": progress,
+                "Shortfall": pipeline.get("shortfall") or 0,
+                "ZIPs used": pipeline.get("zips_used") or 0,
+                "ZIPs available": pipeline.get("zips_total") or 0,
+                "Pages": pipeline.get("pages") or 0,
+                "Requests": pipeline.get("requests") or 0,
+                "Current ZIP": pipeline.get("current_zip") or "—",
+                "Deep scans": deep_locations,
+                "Reallocated": pipeline.get("redistribution_added") or 0,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+st.title("Maps company scraper")
+st.caption(
+    "Concurrent state pipelines with hierarchical quotas, global deduplication, "
+    "deep ZIP pagination, and automatic shortfall redistribution."
+)
+
 with st.sidebar:
-    st.header("Search")
-    search_term = st.text_input("Search term", placeholder="plumber, web design company, …")
+    st.header("Run configuration")
+    search_term = st.text_input(
+        "Search term",
+        placeholder="IT companies, plumber, web design…",
+        key="search_term",
+    )
 
     st.subheader("Location filters")
-    countries = st.multiselect("Country", options=list_countries(), default=["United States"])
-    states = st.multiselect("State(s)", options=list_states())
+    countries = st.multiselect(
+        "Countries",
+        options=list_countries(),
+        default=["United States"],
+        key="countries",
+    )
+    states = st.multiselect("States", options=list_states(), key="states")
     city_options = list_cities(states if states else None)
-    cities = st.multiselect("City / cities", options=city_options)
+    cities = st.multiselect("Cities", options=city_options, key="cities")
 
-    st.subheader("Limits")
+    st.subheader("Targets")
     limit = st.number_input(
-        "Total companies wanted (0 = no limit)",
+        "Total unique companies",
         min_value=0,
         value=50,
         step=10,
-        help="Stop once this many unique companies are collected.",
+        help=(
+            "0 means unlimited. A positive target is divided across selected "
+            "countries, states, and eligible cities. Unmet quota is transferred "
+            "to pipelines that still have ZIP capacity."
+        ),
+        key="limit",
     )
     per_zip_cap = st.number_input(
-        "Results per ZIP",
+        "Initial results per ZIP",
         min_value=1,
         max_value=PAGE_SIZE * MAX_PAGES_PER_ZIP,
         value=DEFAULT_PER_ZIP_CAP,
         help=(
-            "How many unique companies to collect from each ZIP. "
-            "Requests 20 results per page and paginates until this target is met, "
-            "results are exhausted, or no new companies appear."
+            "Normal pass target per ZIP. If a location remains below quota after "
+            "all ZIPs are tried, the deep pass revisits every ZIP and paginates "
+            f"up to {MAX_PAGES_PER_ZIP} pages."
         ),
+        key="per_zip_cap",
     )
 
-    st.subheader("Request pacing")
-    delay_min = st.number_input("Min delay (s)", min_value=0.5, value=DEFAULT_DELAY_MIN, step=0.5)
-    delay_max = st.number_input("Max delay (s)", min_value=1.0, value=DEFAULT_DELAY_MAX, step=0.5)
-
-    st.subheader("Proxies (future)")
-    use_proxies = st.checkbox("Use residential proxies", value=False, disabled=False)
-    proxy_text = st.text_area(
-        "Proxy list (one per line)",
-        placeholder="http://user:pass@host:port",
-        disabled=not use_proxies,
-        height=100,
+    st.subheader("Parallelism and pacing")
+    max_parallel = st.number_input(
+        "Maximum parallel pipelines",
+        min_value=1,
+        max_value=16,
+        value=4,
+        help="Each selected state runs as an independent worker, up to this limit.",
+        key="max_parallel",
     )
-    proxy_urls = [p.strip() for p in (proxy_text or "").splitlines() if p.strip()] if use_proxies else []
+    delay_min = st.number_input(
+        "Minimum delay between ZIPs (seconds)",
+        min_value=0.5,
+        value=DEFAULT_DELAY_MIN,
+        step=0.5,
+        key="delay_min",
+    )
+    delay_max = st.number_input(
+        "Maximum delay between ZIPs (seconds)",
+        min_value=1.0,
+        value=DEFAULT_DELAY_MAX,
+        step=0.5,
+        key="delay_max",
+    )
 
-    col_a, col_b = st.columns(2)
-    start = col_a.button("Start", type="primary", disabled=st.session_state.running or not search_term)
-    stop = col_b.button("Stop", disabled=not st.session_state.running)
+    with st.expander("Proxy settings", icon=":material/vpn_lock:"):
+        use_proxies = st.toggle("Use proxy rotation", value=False, key="use_proxies")
+        proxy_text = st.text_area(
+            "Proxy URLs",
+            placeholder="http://user:pass@host:port",
+            disabled=not use_proxies,
+            height=110,
+            help="One proxy URL per line.",
+            key="proxy_text",
+        )
 
-if stop:
-    st.session_state.stop_flag = True
+    start = st.button(
+        "Start scraping",
+        type="primary",
+        icon=":material/play_arrow:",
+        disabled=st.session_state.running or not search_term.strip(),
+        width="stretch",
+    )
 
-progress_bar = st.progress(0.0, text="Idle")
-status_box = st.empty()
-metrics = st.columns(4)
-m_found = metrics[0].empty()
-m_zips = metrics[1].empty()
-m_last = metrics[2].empty()
-m_status = metrics[3].empty()
+with st.container(border=True):
+    status_heading = st.empty()
+    overall_progress = st.progress(0.0, text="Ready")
 
-table_slot = st.empty()
-log_slot = st.expander("Run log", expanded=False)
+kpi_columns = st.columns(4, border=True)
+kpi_companies = kpi_columns[0].empty()
+kpi_pipelines = kpi_columns[1].empty()
+kpi_zips = kpi_columns[2].empty()
+kpi_pages = kpi_columns[3].empty()
 
-if start and search_term:
-    st.session_state.stop_flag = False
+pipeline_container = st.container(border=True)
+with pipeline_container:
+    st.subheader("Parallel pipeline activity")
+    st.caption(
+        "Each row is an independent state/country worker. Deep scan means the "
+        "normal ZIP pass was insufficient and additional pages are being fetched."
+    )
+    pipeline_slot = st.empty()
+
+results_container = st.container(border=True)
+with results_container:
+    st.subheader("Companies")
+    results_slot = st.empty()
+
+with st.expander("Run log", icon=":material/receipt_long:"):
+    log_slot = st.empty()
+
+
+def render_progress(info: dict, total_target: int) -> None:
+    st.session_state.progress = info
+    st.session_state.results = info.get("companies") or []
+
+    found = int(info.get("companies_found") or 0)
+    active = int(info.get("pipelines_active") or 0)
+    pipeline_total = int(info.get("pipelines_total") or 0)
+    zips_used = int(info.get("zips_used") or 0)
+    zips_total = int(info.get("zips_total") or 0)
+    pages = int(info.get("pages_fetched") or 0)
+    requests = int(info.get("requests_made") or 0)
+    round_number = int(info.get("redistribution_round") or 0)
+
+    if total_target:
+        fraction = min(found / total_target, 1.0)
+        progress_text = f"{found:,} / {total_target:,} unique companies"
+    else:
+        fraction = min(zips_used / max(zips_total, 1), 1.0)
+        progress_text = f"{zips_used:,} / {zips_total:,} ZIPs used"
+    overall_progress.progress(fraction, text=progress_text)
+
+    status = str(info.get("status") or "running").replace("_", " ").capitalize()
+    redistribution = (
+        f" · Redistribution round {round_number}" if round_number else ""
+    )
+    status_heading.markdown(f"**{status}**{redistribution}")
+
+    kpi_companies.metric("Unique companies", f"{found:,}")
+    kpi_pipelines.metric("Active pipelines", f"{active} / {pipeline_total}")
+    kpi_zips.metric("ZIP codes used", f"{zips_used:,} / {zips_total:,}")
+    kpi_pages.metric("Pages / requests", f"{pages:,} / {requests:,}")
+
+    pipeline_df = pipelines_to_df(info.get("pipelines") or [])
+    if pipeline_df.empty:
+        pipeline_slot.info("Pipelines will appear after the run starts.")
+    else:
+        pipeline_slot.dataframe(
+            pipeline_df,
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "Progress": st.column_config.ProgressColumn(
+                    "Progress",
+                    min_value=0,
+                    max_value=100,
+                    format="%d%%",
+                ),
+            },
+        )
+
+    results_df = companies_to_df(st.session_state.results)
+    if not results_df.empty:
+        results_slot.dataframe(results_df, hide_index=True, width="stretch")
+
+    event = info.get("event")
+    if event == "pipeline_done":
+        pipeline = info.get("pipeline") or {}
+        st.session_state.logs.append(
+            f"{pipeline.get('label')}: {pipeline.get('status')} — "
+            f"{pipeline.get('collected')}/{pipeline.get('target')}, "
+            f"{pipeline.get('zips_used')} ZIPs, {pipeline.get('pages')} pages"
+        )
+    elif event == "redistribution_start":
+        allocations = ", ".join(
+            f"{item['label']} +{item['extra']}"
+            for item in info.get("allocations", [])
+        )
+        st.session_state.logs.append(
+            f"Redistribution round {info.get('round')}: {allocations}"
+        )
+    elif event == "deep_scan_start":
+        st.session_state.logs.append(
+            f"Deep pagination started for {info.get('location')}"
+        )
+    elif event == "error":
+        st.session_state.logs.append(f"ERROR: {info.get('message')}")
+
+    if st.session_state.logs:
+        log_slot.code("\n".join(st.session_state.logs[-300:]))
+
+
+if start and search_term.strip():
     st.session_state.running = True
     st.session_state.results = []
     st.session_state.logs = []
     st.session_state.progress = {}
-
-    def on_progress(info: dict) -> None:
-        st.session_state.progress = info
-        st.session_state.results = info.get("companies") or []
-        event = info.get("event")
-        if event == "zip_done":
-            st.session_state.logs.append(
-                f"ZIP {info.get('zip')} ({info.get('city')}): "
-                f"returned {info.get('returned')}, added {info.get('added')}"
-            )
-        elif event == "error":
-            st.session_state.logs.append(f"ERROR: {info.get('message')}")
-
-        tried = info.get("zips_tried") or 0
-        total = max(info.get("zips_total") or 1, 1)
-        progress_bar.progress(min(tried / total, 1.0), text=f"ZIPs {tried}/{total}")
-        status_box.info(info.get("status") or "")
-        m_found.metric("Companies", info.get("companies_found") or 0)
-        m_zips.metric("ZIPs tried", f"{tried}/{info.get('zips_total') or 0}")
-        m_last.metric("Last ZIP added", info.get("last_count") or 0)
-        m_status.metric("Status", (info.get("status") or "")[:40])
-        df_live = companies_to_df(st.session_state.results)
-        if not df_live.empty:
-            table_slot.dataframe(df_live, use_container_width=True, hide_index=True)
+    proxy_urls = [
+        proxy.strip()
+        for proxy in (proxy_text or "").splitlines()
+        if proxy.strip()
+    ] if use_proxies else []
 
     runner = ScraperRunner(
         search_term=search_term,
@@ -151,58 +295,66 @@ if start and search_term:
         delay_max=float(max(delay_max, delay_min)),
         proxy_urls=proxy_urls,
         use_proxies=use_proxies,
-        on_progress=on_progress,
-        should_stop=lambda: st.session_state.stop_flag,
+        max_parallel_pipelines=int(max_parallel),
+        on_progress=lambda info: render_progress(info, int(limit)),
     )
 
-    with st.spinner("Scraping…"):
-        companies = runner.run()
+    try:
+        with st.spinner("Running parallel pipelines…", show_time=True):
+            companies = runner.run()
+        st.session_state.results = companies
+        if companies:
+            csv_path = runner.export_csv()
+            xlsx_path = runner.export_excel()
+            if int(limit) and len(companies) < int(limit):
+                st.warning(
+                    f"All selected location capacity was exhausted. Collected "
+                    f"{len(companies):,} of {int(limit):,} requested companies.",
+                    icon=":material/warning:",
+                )
+            else:
+                st.success(
+                    f"Collected {len(companies):,} unique companies. "
+                    f"Saved as {csv_path.name} and {xlsx_path.name}.",
+                    icon=":material/check_circle:",
+                )
+        else:
+            st.warning(
+                "No companies were collected. Check the filters and run log.",
+                icon=":material/warning:",
+            )
+    finally:
+        st.session_state.running = False
 
-    st.session_state.results = companies
-    st.session_state.running = False
-    st.session_state.stop_flag = False
-
-    # Final exports
-    if companies:
-        csv_path = runner.export_csv()
-        xlsx_path = runner.export_excel()
-        st.success(f"Done — {len(companies)} companies. Saved to `{csv_path.name}` and `{xlsx_path.name}`.")
-    else:
-        st.warning("Finished with 0 companies. Check filters, delays, or debug/ dumps.")
-
-# Always show current results / downloads
 results = st.session_state.results
-df = companies_to_df(results)
-if not df.empty:
-    table_slot.dataframe(df, use_container_width=True, hide_index=True)
-    c1, c2 = st.columns(2)
-    c1.download_button(
-        "Download CSV",
-        data=df.to_csv(index=False).encode("utf-8"),
-        file_name=f"maps_results_{int(time.time())}.csv",
-        mime="text/csv",
-    )
-    # Excel via buffer
-    from io import BytesIO
+results_df = companies_to_df(results)
+if not results_df.empty:
+    results_slot.dataframe(results_df, hide_index=True, width="stretch")
+    download_row = st.container(horizontal=True)
+    with download_row:
+        st.download_button(
+            "Download CSV",
+            data=results_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"maps_results_{int(time.time())}.csv",
+            mime="text/csv",
+            icon=":material/download:",
+        )
+        excel_buffer = BytesIO()
+        results_df.to_excel(excel_buffer, index=False)
+        st.download_button(
+            "Download Excel",
+            data=excel_buffer.getvalue(),
+            file_name=f"maps_results_{int(time.time())}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            icon=":material/download:",
+        )
+elif not st.session_state.running:
+    results_slot.info("Results will appear here during a run.")
 
-    buf = BytesIO()
-    df.to_excel(buf, index=False)
-    c2.download_button(
-        "Download Excel",
-        data=buf.getvalue(),
-        file_name=f"maps_results_{int(time.time())}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-else:
-    table_slot.info("Results will appear here after a run.")
-
-if st.session_state.logs:
-    log_slot.code("\n".join(st.session_state.logs[-200:]))
-
-prog = st.session_state.progress
-if prog:
-    m_found.metric("Companies", prog.get("companies_found") or len(results))
-    m_zips.metric(
-        "ZIPs tried",
-        f"{prog.get('zips_tried') or 0}/{prog.get('zips_total') or 0}",
-    )
+if not st.session_state.progress:
+    status_heading.markdown("**Ready**")
+    kpi_companies.metric("Unique companies", "0")
+    kpi_pipelines.metric("Active pipelines", "0 / 0")
+    kpi_zips.metric("ZIP codes used", "0 / 0")
+    kpi_pages.metric("Pages / requests", "0 / 0")
+    pipeline_slot.info("Pipelines will appear after the run starts.")

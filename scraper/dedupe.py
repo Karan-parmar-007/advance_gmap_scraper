@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from threading import Lock
+
 from .models import Company
 
 
@@ -9,24 +11,37 @@ class DedupeStore:
     def __init__(self) -> None:
         self._seen: set[str] = set()
         self.companies: list[Company] = []
+        self._lock = Lock()
 
     def add(self, company: Company) -> bool:
+        with self._lock:
+            return self._add_unlocked(company)
+
+    def add_many(self, companies: list[Company], max_total: int = 0) -> int:
+        """Add unique companies atomically, optionally stopping at a total cap."""
+        added = 0
+        with self._lock:
+            for company in companies:
+                if max_total and len(self.companies) >= max_total:
+                    break
+                if self._add_unlocked(company):
+                    added += 1
+        return added
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self.companies)
+
+    def snapshot(self) -> list[Company]:
+        with self._lock:
+            return list(self.companies)
+
+    def _add_unlocked(self, company: Company) -> bool:
         key = company.dedupe_key()
         if not key or key in self._seen:
             return False
-        # Also block empty-name
         if not company.name.strip():
             return False
         self._seen.add(key)
         self.companies.append(company)
         return True
-
-    def add_many(self, companies: list[Company]) -> int:
-        added = 0
-        for c in companies:
-            if self.add(c):
-                added += 1
-        return added
-
-    def __len__(self) -> int:
-        return len(self.companies)
