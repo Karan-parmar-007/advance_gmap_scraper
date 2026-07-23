@@ -119,6 +119,9 @@ class ScraperRunner:
         delay_max: float = DEFAULT_DELAY_MAX,
         proxy_urls: list[str] | None = None,
         use_proxies: bool = False,
+        proxy_targeting: str | None = None,
+        proxy_fallback: bool | None = None,
+        proxy_mode: str | None = None,
         max_parallel_pipelines: int = 4,
         on_progress: ProgressCallback | None = None,
         should_stop: Callable[[], bool] | None = None,
@@ -133,6 +136,9 @@ class ScraperRunner:
         self.delay_max = max(self.delay_min, float(delay_max))
         self.proxy_urls = proxy_urls or []
         self.use_proxies = use_proxies
+        self.proxy_targeting = proxy_targeting
+        self.proxy_fallback = proxy_fallback
+        self.proxy_mode = proxy_mode
         self.max_parallel_pipelines = max(1, int(max_parallel_pipelines))
         self.on_progress = on_progress
         self.should_stop = should_stop or (lambda: False)
@@ -339,10 +345,18 @@ class ScraperRunner:
             pipeline.status = "running" if phase == "initial" else "redistributed"
         self._queue_pipeline_event("pipeline_start", pipeline, phase=phase)
 
-        proxy_manager = ProxyManager(
-            proxies=self.proxy_urls,
-            enable_rotation=self.use_proxies and bool(self.proxy_urls),
+        proxy_manager = ProxyManager.from_env(
+            enabled=self.use_proxies,
+            targeting=self.proxy_targeting,
+            fallback=self.proxy_fallback,
+            mode=self.proxy_mode,
         )
+        if self.proxy_urls:
+            proxy_manager.proxies = list(self.proxy_urls)
+            proxy_manager.enable_rotation = self.use_proxies and bool(self.proxy_urls)
+            # Explicit static URLs override DataImpulse auto URL generation.
+            if self.proxy_urls and not proxy_manager.configured:
+                proxy_manager.enabled = False
         client = GMapsClient(proxy_manager=proxy_manager)
         try:
             self._fill_original_location_quotas(pipeline, client)
@@ -548,6 +562,7 @@ class ScraperRunner:
                 query,
                 offset=progress.offset,
                 use_zip_session=True,
+                location=loc,
             )
         finally:
             client.end_zip_session()

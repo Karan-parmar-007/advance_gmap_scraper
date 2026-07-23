@@ -77,7 +77,36 @@ def test_state_and_city_split():
     }
 
 
-def test_limit_zero_returns_single_unlimited_unit():
+def test_states_keep_quota_when_cities_only_match_some():
+    """Selected states without matching cities still get an equal share."""
+    states = [
+        "California",
+        "Idaho",
+        "Kansas",
+        "Texas",
+        "Illinois",
+        "New York",
+    ]
+    cities = [
+        "Anaheim",
+        "Boise",
+        "Bakersfield",
+    ]
+    units = build_scrape_units(
+        limit=5000,
+        countries=["United States"],
+        states=states,
+        cities=cities,
+    )
+    state_quotas: dict[str, int] = {}
+    for unit in units:
+        state_quotas[unit.state] = state_quotas.get(unit.state, 0) + unit.quota
+    assert set(state_quotas) == set(states)
+    assert sum(state_quotas.values()) == 5000
+    assert all(quota in {833, 834} for quota in state_quotas.values())
+
+
+def test_limit_zero_returns_state_units():
     units = build_scrape_units(
         limit=0,
         countries=["United States"],
@@ -87,6 +116,7 @@ def test_limit_zero_returns_single_unlimited_unit():
     assert len(units) == 1
     assert units[0].quota == 0
     assert units[0].zips
+    assert all(z.city == "Chicago" for z in units[0].zips)
 
 
 if __name__ == "__main__":
@@ -96,5 +126,6 @@ if __name__ == "__main__":
     test_city_split_when_quota_large_enough()
     test_city_split_skipped_when_below_minimum()
     test_state_and_city_split()
-    test_limit_zero_returns_single_unlimited_unit()
+    test_states_keep_quota_when_cities_only_match_some()
+    test_limit_zero_returns_state_units()
     print("All quota tests passed.")

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import threading
 import time
+from dataclasses import dataclass, field
 from io import BytesIO
+from typing import Any
 
 import pandas as pd
 import streamlit as st
@@ -14,9 +17,14 @@ from scraper.config import (
     DEFAULT_PER_ZIP_CAP,
     MAX_PAGES_PER_ZIP,
     PAGE_SIZE,
+    PROXY_ENABLED,
+    PROXY_MODE,
+    PROXY_TARGETING,
     ensure_dirs,
 )
 from scraper.locations import list_cities, list_countries, list_states
+from scraper.proxy_manager import PROXY_MODES, ProxyManager, TARGETING_LEVELS
+from scraper.quotas import preview_pipeline_plan
 from scraper.runner import ScraperRunner
 
 
@@ -27,10 +35,42 @@ st.set_page_config(
 )
 ensure_dirs()
 
-st.session_state.setdefault("running", False)
-st.session_state.setdefault("results", [])
-st.session_state.setdefault("progress", {})
-st.session_state.setdefault("logs", [])
+
+@dataclass
+class RunState:
+    """Thread-safe scrape state. Worker never touches st.session_state."""
+
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    stop_event: threading.Event = field(default_factory=threading.Event)
+    running: bool = False
+    progress: dict[str, Any] = field(default_factory=dict)
+    results: list = field(default_factory=list)
+    logs: list[str] = field(default_factory=list)
+    run_error: str = ""
+    run_message: str = ""
+    worker: threading.Thread | None = None
+
+    def append_log(self, message: str) -> None:
+        with self.lock:
+            self.logs.append(message)
+            self.logs = self.logs[-300:]
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            return {
+                "running": self.running,
+                "progress": dict(self.progress),
+                "results": list(self.results),
+                "logs": list(self.logs),
+                "run_error": self.run_error,
+                "run_message": self.run_message,
+            }
+
+
+def get_run_state() -> RunState:
+    if "run_state" not in st.session_state:
+        st.session_state.run_state = RunState()
+    return st.session_state.run_state
 
 
 def companies_to_df(companies: list) -> pd.DataFrame:
@@ -70,132 +110,60 @@ def pipelines_to_df(pipelines: list[dict]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-st.title("Maps company scraper")
-st.caption(
-    "Concurrent state pipelines with hierarchical quotas, global deduplication, "
-    "deep ZIP pagination, and automatic shortfall redistribution."
-)
+def make_progress_callback(run_state: RunState):
+    def on_progress(info: dict) -> None:
+        with run_state.lock:
+            # Keep UI updates light: store company rows only as plain dicts.
+            companies = info.get("companies") or []
+            if companies and hasattr(companies[0], "to_dict"):
+                companies = [company.to_dict() for company in companies]
+            payload = dict(info)
+            payload["companies"] = companies
+            run_state.progress = payload
+            run_state.results = companies
 
-with st.sidebar:
-    st.header("Run configuration")
-    search_term = st.text_input(
-        "Search term",
-        placeholder="IT companies, plumber, web design…",
-        key="search_term",
-    )
+            event = info.get("event")
+            if event == "pipeline_done":
+                pipeline = info.get("pipeline") or {}
+                run_state.logs.append(
+                    f"{pipeline.get('label')}: {pipeline.get('status')} — "
+                    f"{pipeline.get('collected')}/{pipeline.get('target')}, "
+                    f"{pipeline.get('zips_used')} ZIPs, {pipeline.get('pages')} pages"
+                )
+            elif event == "redistribution_start":
+                allocations = ", ".join(
+                    f"{item['label']} +{item['extra']}"
+                    for item in info.get("allocations", [])
+                )
+                run_state.logs.append(
+                    f"Redistribution round {info.get('round')}: {allocations}"
+                )
+            elif event == "deep_scan_start":
+                run_state.logs.append(
+                    f"Deep pagination started for {info.get('location')}"
+                )
+            elif event == "error":
+                run_state.logs.append(f"ERROR: {info.get('message')}")
+            elif event == "run_start":
+                pipelines = info.get("pipelines") or []
+                run_state.logs.append(
+                    f"Starting {len(pipelines)} pipeline(s): "
+                    + ", ".join(
+                        f"{p.get('label')}={p.get('target')}" for p in pipelines
+                    )
+                )
+            run_state.logs = run_state.logs[-300:]
 
-    st.subheader("Location filters")
-    countries = st.multiselect(
-        "Countries",
-        options=list_countries(),
-        default=["United States"],
-        key="countries",
-    )
-    states = st.multiselect("States", options=list_states(), key="states")
-    city_options = list_cities(states if states else None)
-    cities = st.multiselect("Cities", options=city_options, key="cities")
-
-    st.subheader("Targets")
-    limit = st.number_input(
-        "Total unique companies",
-        min_value=0,
-        value=50,
-        step=10,
-        help=(
-            "0 means unlimited. A positive target is divided across selected "
-            "countries, states, and eligible cities. Unmet quota is transferred "
-            "to pipelines that still have ZIP capacity."
-        ),
-        key="limit",
-    )
-    per_zip_cap = st.number_input(
-        "Initial results per ZIP",
-        min_value=1,
-        max_value=PAGE_SIZE * MAX_PAGES_PER_ZIP,
-        value=DEFAULT_PER_ZIP_CAP,
-        help=(
-            "Normal pass target per ZIP. If a location remains below quota after "
-            "all ZIPs are tried, the deep pass revisits every ZIP and paginates "
-            f"up to {MAX_PAGES_PER_ZIP} pages."
-        ),
-        key="per_zip_cap",
-    )
-
-    st.subheader("Parallelism and pacing")
-    max_parallel = st.number_input(
-        "Maximum parallel pipelines",
-        min_value=1,
-        max_value=16,
-        value=4,
-        help="Each selected state runs as an independent worker, up to this limit.",
-        key="max_parallel",
-    )
-    delay_min = st.number_input(
-        "Minimum delay between ZIPs (seconds)",
-        min_value=0.5,
-        value=DEFAULT_DELAY_MIN,
-        step=0.5,
-        key="delay_min",
-    )
-    delay_max = st.number_input(
-        "Maximum delay between ZIPs (seconds)",
-        min_value=1.0,
-        value=DEFAULT_DELAY_MAX,
-        step=0.5,
-        key="delay_max",
-    )
-
-    with st.expander("Proxy settings", icon=":material/vpn_lock:"):
-        use_proxies = st.toggle("Use proxy rotation", value=False, key="use_proxies")
-        proxy_text = st.text_area(
-            "Proxy URLs",
-            placeholder="http://user:pass@host:port",
-            disabled=not use_proxies,
-            height=110,
-            help="One proxy URL per line.",
-            key="proxy_text",
-        )
-
-    start = st.button(
-        "Start scraping",
-        type="primary",
-        icon=":material/play_arrow:",
-        disabled=st.session_state.running or not search_term.strip(),
-        width="stretch",
-    )
-
-with st.container(border=True):
-    status_heading = st.empty()
-    overall_progress = st.progress(0.0, text="Ready")
-
-kpi_columns = st.columns(4, border=True)
-kpi_companies = kpi_columns[0].empty()
-kpi_pipelines = kpi_columns[1].empty()
-kpi_zips = kpi_columns[2].empty()
-kpi_pages = kpi_columns[3].empty()
-
-pipeline_container = st.container(border=True)
-with pipeline_container:
-    st.subheader("Parallel pipeline activity")
-    st.caption(
-        "Each row is an independent state/country worker. Deep scan means the "
-        "normal ZIP pass was insufficient and additional pages are being fetched."
-    )
-    pipeline_slot = st.empty()
-
-results_container = st.container(border=True)
-with results_container:
-    st.subheader("Companies")
-    results_slot = st.empty()
-
-with st.expander("Run log", icon=":material/receipt_long:"):
-    log_slot = st.empty()
+    return on_progress
 
 
-def render_progress(info: dict, total_target: int) -> None:
-    st.session_state.progress = info
-    st.session_state.results = info.get("companies") or []
-
+def render_progress(
+    info: dict,
+    *,
+    total_target: int,
+    results: list,
+    logs: list[str],
+) -> None:
     found = int(info.get("companies_found") or 0)
     active = int(info.get("pipelines_active") or 0)
     pipeline_total = int(info.get("pipelines_total") or 0)
@@ -242,92 +210,375 @@ def render_progress(info: dict, total_target: int) -> None:
             },
         )
 
-    results_df = companies_to_df(st.session_state.results)
+    results_df = companies_to_df(results)
     if not results_df.empty:
         results_slot.dataframe(results_df, hide_index=True, width="stretch")
 
-    event = info.get("event")
-    if event == "pipeline_done":
-        pipeline = info.get("pipeline") or {}
-        st.session_state.logs.append(
-            f"{pipeline.get('label')}: {pipeline.get('status')} — "
-            f"{pipeline.get('collected')}/{pipeline.get('target')}, "
-            f"{pipeline.get('zips_used')} ZIPs, {pipeline.get('pages')} pages"
-        )
-    elif event == "redistribution_start":
-        allocations = ", ".join(
-            f"{item['label']} +{item['extra']}"
-            for item in info.get("allocations", [])
-        )
-        st.session_state.logs.append(
-            f"Redistribution round {info.get('round')}: {allocations}"
-        )
-    elif event == "deep_scan_start":
-        st.session_state.logs.append(
-            f"Deep pagination started for {info.get('location')}"
-        )
-    elif event == "error":
-        st.session_state.logs.append(f"ERROR: {info.get('message')}")
-
-    if st.session_state.logs:
-        log_slot.code("\n".join(st.session_state.logs[-300:]))
+    if logs:
+        log_slot.code("\n".join(logs[-300:]))
 
 
-if start and search_term.strip():
-    st.session_state.running = True
-    st.session_state.results = []
-    st.session_state.logs = []
-    st.session_state.progress = {}
-    proxy_urls = [
-        proxy.strip()
-        for proxy in (proxy_text or "").splitlines()
-        if proxy.strip()
-    ] if use_proxies else []
-
-    runner = ScraperRunner(
-        search_term=search_term,
-        countries=countries,
-        states=states,
-        cities=cities,
-        limit=int(limit),
-        per_zip_cap=int(per_zip_cap),
-        delay_min=float(delay_min),
-        delay_max=float(max(delay_max, delay_min)),
-        proxy_urls=proxy_urls,
-        use_proxies=use_proxies,
-        max_parallel_pipelines=int(max_parallel),
-        on_progress=lambda info: render_progress(info, int(limit)),
-    )
-
+def run_worker(config: dict, run_state: RunState) -> None:
+    """Background worker: uses only the shared RunState object."""
     try:
-        with st.spinner("Running parallel pipelines…", show_time=True):
-            companies = runner.run()
-        st.session_state.results = companies
-        if companies:
-            csv_path = runner.export_csv()
-            xlsx_path = runner.export_excel()
-            if int(limit) and len(companies) < int(limit):
-                st.warning(
-                    f"All selected location capacity was exhausted. Collected "
-                    f"{len(companies):,} of {int(limit):,} requested companies.",
-                    icon=":material/warning:",
+        runner = ScraperRunner(
+            search_term=config["search_term"],
+            countries=config["countries"],
+            states=config["states"],
+            cities=config["cities"],
+            limit=config["limit"],
+            per_zip_cap=config["per_zip_cap"],
+            delay_min=config["delay_min"],
+            delay_max=config["delay_max"],
+            proxy_urls=config["proxy_urls"],
+            use_proxies=config["use_proxies"],
+            proxy_targeting=config["proxy_targeting"],
+            proxy_mode=config["proxy_mode"],
+            max_parallel_pipelines=config["max_parallel"],
+            on_progress=make_progress_callback(run_state),
+            should_stop=run_state.stop_event.is_set,
+        )
+        companies = runner.run()
+        company_rows = [
+            company.to_dict() if hasattr(company, "to_dict") else company
+            for company in companies
+        ]
+        with run_state.lock:
+            run_state.results = company_rows
+            if run_state.stop_event.is_set():
+                run_state.run_message = (
+                    f"Stopped early with {len(company_rows):,} unique companies."
+                )
+            elif config["limit"] and len(company_rows) < config["limit"]:
+                run_state.run_message = (
+                    f"Capacity exhausted: collected {len(company_rows):,} of "
+                    f"{config['limit']:,} requested companies."
+                )
+            elif company_rows:
+                csv_path = runner.export_csv()
+                xlsx_path = runner.export_excel()
+                run_state.run_message = (
+                    f"Collected {len(company_rows):,} unique companies. "
+                    f"Saved as {csv_path.name} and {xlsx_path.name}."
                 )
             else:
-                st.success(
-                    f"Collected {len(companies):,} unique companies. "
-                    f"Saved as {csv_path.name} and {xlsx_path.name}.",
-                    icon=":material/check_circle:",
+                run_state.run_message = (
+                    "No companies were collected. Check the filters and run log."
                 )
-        else:
-            st.warning(
-                "No companies were collected. Check the filters and run log.",
-                icon=":material/warning:",
-            )
+    except Exception as exc:
+        with run_state.lock:
+            run_state.run_error = str(exc)
+            run_state.logs.append(f"ERROR: {exc}")
+            run_state.logs = run_state.logs[-300:]
     finally:
-        st.session_state.running = False
+        with run_state.lock:
+            run_state.running = False
 
-results = st.session_state.results
-results_df = companies_to_df(results)
+
+run_state = get_run_state()
+
+st.title("Maps company scraper")
+st.caption(
+    "Concurrent state pipelines with hierarchical quotas, global deduplication, "
+    "deep ZIP pagination, and automatic shortfall redistribution."
+)
+
+with st.sidebar:
+    st.header("Run configuration")
+    search_term = st.text_input(
+        "Search term",
+        placeholder="IT companies, plumber, web design…",
+        key="search_term",
+    )
+
+    st.subheader("Location filters")
+    countries = st.multiselect(
+        "Countries",
+        options=list_countries(),
+        default=["United States"],
+        key="countries",
+    )
+    states = st.multiselect("States", options=list_states(), key="states")
+    city_options = list_cities(states if states else None)
+    cities = st.multiselect(
+        "Cities",
+        options=city_options,
+        key="cities",
+        help=(
+            "Optional. Cities narrow ZIPs inside a state when they match. "
+            "States without a matching city still keep their full ZIP pool "
+            "and equal quota share."
+        ),
+    )
+
+    st.subheader("Targets")
+    limit = st.number_input(
+        "Total unique companies",
+        min_value=0,
+        value=50,
+        step=10,
+        help=(
+            "0 means unlimited. A positive target is divided evenly across "
+            "selected states. Unmet quota is transferred to pipelines that "
+            "still have ZIP capacity."
+        ),
+        key="limit",
+    )
+    per_zip_cap = st.number_input(
+        "Initial results per ZIP",
+        min_value=1,
+        max_value=PAGE_SIZE * MAX_PAGES_PER_ZIP,
+        value=DEFAULT_PER_ZIP_CAP,
+        help=(
+            "Normal pass target per ZIP. If a location remains below quota after "
+            "all ZIPs are tried, the deep pass revisits every ZIP and paginates "
+            f"up to {MAX_PAGES_PER_ZIP} pages."
+        ),
+        key="per_zip_cap",
+    )
+
+    st.subheader("Parallelism and pacing")
+    max_parallel = st.number_input(
+        "Maximum parallel pipelines",
+        min_value=1,
+        max_value=16,
+        value=4,
+        help="Each selected state runs as an independent worker, up to this limit.",
+        key="max_parallel",
+    )
+    delay_min = st.number_input(
+        "Minimum delay between ZIPs (seconds)",
+        min_value=0.5,
+        value=DEFAULT_DELAY_MIN,
+        step=0.5,
+        key="delay_min",
+    )
+    delay_max = st.number_input(
+        "Maximum delay between ZIPs (seconds)",
+        min_value=1.0,
+        value=DEFAULT_DELAY_MAX,
+        step=0.5,
+        key="delay_max",
+    )
+
+    with st.expander("Proxy settings", icon=":material/vpn_lock:"):
+        proxy_from_env = ProxyManager.from_env()
+        use_proxies = st.toggle(
+            "Use DataImpulse residential proxies",
+            value=PROXY_ENABLED and proxy_from_env.configured,
+            key="use_proxies",
+            help=(
+                "Reads credentials from `.env`. Sticky mode keeps one IP per ZIP "
+                "while paginating (ports 10000-20000)."
+            ),
+        )
+        mode_default = PROXY_MODE if PROXY_MODE in PROXY_MODES else "sticky"
+        proxy_mode = st.selectbox(
+            "Proxy mode",
+            options=list(PROXY_MODES),
+            index=list(PROXY_MODES).index(mode_default),
+            disabled=not use_proxies,
+            help=(
+                "sticky: same residential IP for all pages of one ZIP "
+                "(port 10000-20000). rotating: IP changes often (port 823)."
+            ),
+            key="proxy_mode",
+        )
+        targeting_default = (
+            PROXY_TARGETING if PROXY_TARGETING in TARGETING_LEVELS else "country"
+        )
+        proxy_targeting = st.selectbox(
+            "Geo targeting",
+            options=list(TARGETING_LEVELS),
+            index=list(TARGETING_LEVELS).index(targeting_default),
+            disabled=not use_proxies,
+            help=(
+                "country = 1x traffic (recommended). "
+                "state/city/zip = Target Filters at 2x traffic."
+            ),
+            key="proxy_targeting",
+        )
+        if use_proxies:
+            if proxy_from_env.configured:
+                port_hint = (
+                    "10000-20000 sticky"
+                    if proxy_mode == "sticky"
+                    else f"{proxy_from_env.port} rotating"
+                )
+                st.caption(
+                    f"Using `{proxy_from_env.host}` · {port_hint} · "
+                    f"login `{proxy_from_env.login[:6]}…`"
+                )
+            else:
+                st.warning(
+                    "Proxy credentials missing. Add DATAIMPULSE_LOGIN / "
+                    "DATAIMPULSE_PASSWORD to `.env`.",
+                    icon=":material/warning:",
+                )
+            if proxy_targeting == "country":
+                st.caption("Country targeting only — standard traffic rate.")
+            else:
+                st.caption(
+                    "Target Filters selected — DataImpulse bills this traffic at 2x."
+                )
+        proxy_text = st.text_area(
+            "Optional static proxy URLs (override)",
+            placeholder="http://user:pass@host:port",
+            disabled=not use_proxies,
+            height=90,
+            help="Leave empty to use DataImpulse credentials from `.env`.",
+            key="proxy_text",
+        )
+
+    plan = preview_pipeline_plan(
+        limit=int(limit),
+        countries=countries or None,
+        states=states or None,
+        cities=cities or None,
+    )
+    if plan:
+        st.caption(
+            f"Plan: {len(plan)} state pipeline(s) · "
+            + ", ".join(f"{row['state']}={row['quota']}" for row in plan)
+        )
+        if int(max_parallel) < len(plan):
+            st.caption(
+                f"Note: only {int(max_parallel)} of {len(plan)} pipelines can run "
+                "at once with the current parallel limit."
+            )
+
+    snapshot = run_state.snapshot()
+    start_col, stop_col = st.columns(2)
+    start = start_col.button(
+        "Start",
+        type="primary",
+        icon=":material/play_arrow:",
+        disabled=snapshot["running"] or not search_term.strip(),
+        width="stretch",
+    )
+    stop = stop_col.button(
+        "Stop",
+        icon=":material/stop:",
+        disabled=not snapshot["running"],
+        width="stretch",
+    )
+
+with st.container(border=True):
+    status_heading = st.empty()
+    overall_progress = st.progress(0.0, text="Ready")
+
+kpi_columns = st.columns(4, border=True)
+kpi_companies = kpi_columns[0].empty()
+kpi_pipelines = kpi_columns[1].empty()
+kpi_zips = kpi_columns[2].empty()
+kpi_pages = kpi_columns[3].empty()
+
+pipeline_container = st.container(border=True)
+with pipeline_container:
+    st.subheader("Parallel pipeline activity")
+    st.caption(
+        "Each row is an independent state worker. Deep scan means the normal ZIP "
+        "pass was insufficient and additional pages are being fetched."
+    )
+    pipeline_slot = st.empty()
+
+results_container = st.container(border=True)
+with results_container:
+    st.subheader("Companies")
+    results_slot = st.empty()
+
+with st.expander("Run log", icon=":material/receipt_long:"):
+    log_slot = st.empty()
+
+if stop and snapshot["running"]:
+    run_state.stop_event.set()
+    run_state.append_log("Stop requested — finishing current requests…")
+    st.toast("Stopping after the current requests finish.", icon=":material/stop:")
+
+if start and search_term.strip() and not snapshot["running"]:
+    worker = run_state.worker
+    if worker is not None and worker.is_alive():
+        st.warning("A scrape is already running.")
+    else:
+        with run_state.lock:
+            run_state.running = True
+            run_state.stop_event.clear()
+            run_state.results = []
+            run_state.logs = []
+            run_state.progress = {}
+            run_state.run_error = ""
+            run_state.run_message = ""
+
+        proxy_urls = [
+            proxy.strip()
+            for proxy in (proxy_text or "").splitlines()
+            if proxy.strip()
+        ] if use_proxies else []
+
+        config = {
+            "search_term": search_term,
+            "countries": countries,
+            "states": states,
+            "cities": cities,
+            "limit": int(limit),
+            "per_zip_cap": int(per_zip_cap),
+            "delay_min": float(delay_min),
+            "delay_max": float(max(delay_max, delay_min)),
+            "proxy_urls": proxy_urls,
+            "use_proxies": use_proxies,
+            "proxy_targeting": proxy_targeting if use_proxies else None,
+            "proxy_mode": proxy_mode if use_proxies else None,
+            "max_parallel": int(max_parallel),
+        }
+        thread = threading.Thread(
+            target=run_worker,
+            args=(config, run_state),
+            name="maps-scraper-ui",
+            daemon=True,
+        )
+        run_state.worker = thread
+        thread.start()
+        run_state.append_log(
+            f"Queued scrape for {len(plan)} state pipeline(s) "
+            f"(max parallel {int(max_parallel)})."
+        )
+        st.rerun()
+
+snapshot = run_state.snapshot()
+
+if snapshot["running"]:
+    info = snapshot["progress"]
+    if info:
+        render_progress(
+            info,
+            total_target=int(limit),
+            results=snapshot["results"],
+            logs=snapshot["logs"],
+        )
+    else:
+        status_heading.markdown("**Starting pipelines…**")
+        if snapshot["logs"]:
+            log_slot.code("\n".join(snapshot["logs"][-300:]))
+    time.sleep(0.8)
+    st.rerun()
+
+info = snapshot["progress"]
+if info:
+    render_progress(
+        info,
+        total_target=int(limit),
+        results=snapshot["results"],
+        logs=snapshot["logs"],
+    )
+else:
+    status_heading.markdown("**Ready**")
+    kpi_companies.metric("Unique companies", "0")
+    kpi_pipelines.metric("Active pipelines", "0 / 0")
+    kpi_zips.metric("ZIP codes used", "0 / 0")
+    kpi_pages.metric("Pages / requests", "0 / 0")
+    pipeline_slot.info("Pipelines will appear after the run starts.")
+
+results_df = companies_to_df(snapshot["results"])
 if not results_df.empty:
     results_slot.dataframe(results_df, hide_index=True, width="stretch")
     download_row = st.container(horizontal=True)
@@ -348,13 +599,16 @@ if not results_df.empty:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             icon=":material/download:",
         )
-elif not st.session_state.running:
+elif not snapshot["running"]:
     results_slot.info("Results will appear here during a run.")
 
-if not st.session_state.progress:
-    status_heading.markdown("**Ready**")
-    kpi_companies.metric("Unique companies", "0")
-    kpi_pipelines.metric("Active pipelines", "0 / 0")
-    kpi_zips.metric("ZIP codes used", "0 / 0")
-    kpi_pages.metric("Pages / requests", "0 / 0")
-    pipeline_slot.info("Pipelines will appear after the run starts.")
+if snapshot["run_error"]:
+    st.error(snapshot["run_error"], icon=":material/error:")
+elif snapshot["run_message"] and not snapshot["running"]:
+    if "Stopped" in snapshot["run_message"] or "exhausted" in snapshot["run_message"]:
+        st.warning(snapshot["run_message"], icon=":material/warning:")
+    else:
+        st.success(snapshot["run_message"], icon=":material/check_circle:")
+
+if snapshot["logs"]:
+    log_slot.code("\n".join(snapshot["logs"][-300:]))

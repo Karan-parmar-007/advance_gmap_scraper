@@ -55,14 +55,18 @@ def build_location_hierarchy(
     *,
     countries: list[str] | None = None,
     states: list[str] | None = None,
-    cities: list[str] | None = None,
     path: str | None = None,
 ) -> list[CountryNode]:
-    """Group filtered ZIP rows as country → state → city."""
+    """
+    Group ZIP rows as country → state → city.
+
+    City filters are applied later per-state so a selected state is never
+    dropped just because none of the selected cities live in it.
+    """
     locs = build_zip_pool(
         countries=countries,
         states=states,
-        cities=cities,
+        cities=None,
         shuffle=False,
         path=path,
     )
@@ -92,131 +96,83 @@ def _selected_cities_in_state(
     ]
 
 
-def _collect_scope_zips(
-    state_nodes: list[StateNode],
+def _cities_for_state(
+    snode: StateNode,
     cities_sel: list[str],
-) -> list[ZipLocation]:
-    zips: list[ZipLocation] = []
-    if cities_sel:
-        for snode in state_nodes:
-            for _, city_zips in _selected_cities_in_state(snode, cities_sel):
-                zips.extend(city_zips)
-        return zips
+) -> list[tuple[str, list[ZipLocation]]]:
+    """
+    Apply city filter only when it matches cities inside this state.
 
-    for snode in state_nodes:
-        for city_zips in snode.cities.values():
-            zips.extend(city_zips)
-    return zips
-
-
-def _scope_label(
-    country: str,
-    state_nodes: list[StateNode],
-    city: str | None,
-) -> tuple[str, str, str, str | None]:
-    if city and state_nodes:
-        loc = next(
-            (z for snode in state_nodes for zips in snode.cities.values() for z in zips if z.city == city),
-            None,
-        )
-        if loc:
-            return country, loc.state, loc.state_abbr, city
-
-    if len(state_nodes) == 1:
-        snode = state_nodes[0]
-        return country, snode.state, snode.state_abbr, city
-
-    return country, "", "", city
+    If the user selected cities from other states only, keep ALL cities in
+    this state so the state pipeline still runs.
+    """
+    all_cities = [
+        (city, zips)
+        for city, zips in sorted(snode.cities.items(), key=lambda item: item[0].lower())
+    ]
+    if not cities_sel:
+        return all_cities
+    matched = _selected_cities_in_state(snode, cities_sel)
+    return matched if matched else all_cities
 
 
 def _append_city_units(
     units: list[GeoUnit],
     *,
     country: str,
-    state_nodes: list[StateNode],
+    snode: StateNode,
     quota: int,
     cities_sel: list[str],
     min_city_quota: int,
 ) -> None:
-    if quota <= 0 or not state_nodes:
+    if quota <= 0:
         return
 
-    if cities_sel:
-        selected: list[tuple[str, list[ZipLocation]]] = []
-        for snode in state_nodes:
-            selected.extend(_selected_cities_in_state(snode, cities_sel))
+    selected = _cities_for_state(snode, cities_sel)
+    if not selected:
+        return
 
-        if not selected:
-            return
-
-        if (
-            len(cities_sel) > 1
-            and len(selected) > 1
-            and (quota // len(selected)) >= min_city_quota
+    # Split within this state only when every city would get a meaningful quota.
+    if len(selected) > 1 and (quota // len(selected)) >= min_city_quota:
+        for (city, zips), city_quota in zip(
+            selected,
+            divide_evenly(quota, len(selected)),
         ):
-            for (city, zips), city_quota in zip(
-                selected,
-                divide_evenly(quota, len(selected)),
-            ):
-                loc = zips[0]
-                units.append(
-                    GeoUnit(
-                        country=country,
-                        state=loc.state,
-                        state_abbr=loc.state_abbr,
-                        city=city,
-                        quota=city_quota,
-                        zips=list(zips),
-                    )
-                )
-            return
-
-        if len(selected) == 1:
-            city, zips = selected[0]
-            loc = zips[0]
             units.append(
                 GeoUnit(
                     country=country,
-                    state=loc.state,
-                    state_abbr=loc.state_abbr,
+                    state=snode.state,
+                    state_abbr=snode.state_abbr,
                     city=city,
-                    quota=quota,
+                    quota=city_quota,
                     zips=list(zips),
                 )
             )
-            return
+        return
 
-        zips = []
-        for _, city_zips in selected:
-            zips.extend(city_zips)
-        loc = zips[0]
+    if len(selected) == 1:
+        city, zips = selected[0]
         units.append(
             GeoUnit(
                 country=country,
-                state=loc.state,
-                state_abbr=loc.state_abbr,
-                city=None,
+                state=snode.state,
+                state_abbr=snode.state_abbr,
+                city=city if cities_sel else None,
                 quota=quota,
-                zips=zips,
+                zips=list(zips),
             )
         )
         return
 
-    zips = _collect_scope_zips(state_nodes, cities_sel)
-    if not zips:
-        return
-
-    country_name, state, abbr, city = _scope_label(
-        country,
-        state_nodes,
-        None,
-    )
+    zips: list[ZipLocation] = []
+    for _, city_zips in selected:
+        zips.extend(city_zips)
     units.append(
         GeoUnit(
-            country=country_name,
-            state=state,
-            state_abbr=abbr,
-            city=city,
+            country=country,
+            state=snode.state,
+            state_abbr=snode.state_abbr,
+            city=None,
             quota=quota,
             zips=zips,
         )
@@ -239,25 +195,50 @@ def _append_country_units(
     if not state_nodes:
         return
 
-    if states_sel and len(states_sel) > 1:
-        for snode, state_quota in zip(state_nodes, divide_evenly(quota, len(state_nodes))):
+    # Multiple selected states → one equal share / pipeline per state.
+    if states_sel and len(state_nodes) > 1:
+        for snode, state_quota in zip(
+            state_nodes,
+            divide_evenly(quota, len(state_nodes)),
+        ):
             _append_city_units(
                 units,
                 country=cnode.country,
-                state_nodes=[snode],
+                snode=snode,
                 quota=state_quota,
                 cities_sel=cities_sel,
                 min_city_quota=min_city_quota,
             )
         return
 
-    _append_city_units(
-        units,
-        country=cnode.country,
-        state_nodes=state_nodes,
-        quota=quota,
-        cities_sel=cities_sel,
-        min_city_quota=min_city_quota,
+    # One selected state (or hierarchy collapsed to one).
+    if len(state_nodes) == 1:
+        _append_city_units(
+            units,
+            country=cnode.country,
+            snode=state_nodes[0],
+            quota=quota,
+            cities_sel=cities_sel,
+            min_city_quota=min_city_quota,
+        )
+        return
+
+    # Country selected with no state multi-filter: one combined unit.
+    zips: list[ZipLocation] = []
+    for snode in state_nodes:
+        for _, city_zips in _cities_for_state(snode, cities_sel):
+            zips.extend(city_zips)
+    if not zips:
+        return
+    units.append(
+        GeoUnit(
+            country=cnode.country,
+            state="",
+            state_abbr="",
+            city=None,
+            quota=quota,
+            zips=zips,
+        )
     )
 
 
@@ -276,6 +257,9 @@ def build_scrape_units(
     When *limit* is 0, returns one unit with quota 0 (unlimited flat scrape).
     When *limit* > 0, divides evenly across selected countries, then states,
     then cities (city split only if each city would get at least *min_city_quota*).
+
+    City filters narrow ZIPs inside a state when matches exist; states without
+    matching cities still keep their full ZIP pool and their equal quota share.
     """
     countries_sel = countries or []
     states_sel = states or []
@@ -284,32 +268,37 @@ def build_scrape_units(
     hierarchy = build_location_hierarchy(
         countries=countries or None,
         states=states or None,
-        cities=cities or None,
         path=path,
     )
     if not hierarchy:
         return []
 
     if limit <= 0:
-        pool = build_zip_pool(
-            countries=countries or None,
-            states=states or None,
-            cities=cities or None,
-            shuffle=True,
-            path=path,
-        )
-        return [
-            GeoUnit(
-                country="",
-                state="",
-                state_abbr="",
-                city=None,
-                quota=0,
-                zips=pool,
-            )
-        ]
+        # Unlimited: still respect optional city narrowing where it matches.
+        units: list[GeoUnit] = []
+        for cnode in hierarchy:
+            for snode in sorted(cnode.states.values(), key=lambda n: n.state.lower()):
+                selected = _cities_for_state(snode, cities_sel)
+                zips: list[ZipLocation] = []
+                for _, city_zips in selected:
+                    zips.extend(city_zips)
+                if not zips:
+                    continue
+                units.append(
+                    GeoUnit(
+                        country=cnode.country,
+                        state=snode.state,
+                        state_abbr=snode.state_abbr,
+                        city=None,
+                        quota=0,
+                        zips=zips,
+                    )
+                )
+        for unit in units:
+            random.shuffle(unit.zips)
+        return units
 
-    units: list[GeoUnit] = []
+    units = []
     divide_countries = bool(countries_sel and len(countries_sel) > 1 and len(hierarchy) > 1)
     if divide_countries:
         country_quotas = divide_evenly(limit, len(hierarchy))
@@ -330,3 +319,36 @@ def build_scrape_units(
         random.shuffle(unit.zips)
 
     return [unit for unit in units if unit.zips]
+
+
+def preview_pipeline_plan(
+    *,
+    limit: int,
+    countries: list[str] | None = None,
+    states: list[str] | None = None,
+    cities: list[str] | None = None,
+) -> list[dict]:
+    """Return a compact plan of state pipelines and quotas for the UI."""
+    units = build_scrape_units(
+        limit=limit,
+        countries=countries,
+        states=states,
+        cities=cities,
+    )
+    by_state: dict[tuple[str, str], dict] = {}
+    for unit in units:
+        key = (unit.country, unit.state or unit.label())
+        row = by_state.setdefault(
+            key,
+            {
+                "country": unit.country,
+                "state": unit.state_abbr or unit.state or unit.label(),
+                "quota": 0,
+                "zips": 0,
+                "cities": 0,
+            },
+        )
+        row["quota"] += unit.quota
+        row["zips"] += len(unit.zips)
+        row["cities"] += 1 if unit.city else len({z.city for z in unit.zips})
+    return sorted(by_state.values(), key=lambda item: item["state"])

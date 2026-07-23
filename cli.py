@@ -6,7 +6,8 @@ import argparse
 import json
 import sys
 
-from scraper.config import ensure_dirs
+from scraper.config import PROXY_ENABLED, PROXY_MODE, PROXY_TARGETING, ensure_dirs
+from scraper.proxy_manager import PROXY_MODES, TARGETING_LEVELS
 from scraper.runner import ScraperRunner
 
 
@@ -34,11 +35,35 @@ def main(argv: list[str] | None = None) -> int:
         default=4,
         help="Maximum concurrent state/country pipelines",
     )
-    p.add_argument("--proxy", action="append", default=[], help="Proxy URL (repeatable)")
+    p.add_argument(
+        "--use-proxy",
+        action="store_true",
+        default=PROXY_ENABLED,
+        help="Use DataImpulse residential proxies from .env (default from PROXY_ENABLED)",
+    )
+    p.add_argument(
+        "--no-proxy",
+        action="store_true",
+        help="Disable proxies even if PROXY_ENABLED=true",
+    )
+    p.add_argument(
+        "--proxy-mode",
+        choices=list(PROXY_MODES),
+        default=PROXY_MODE if PROXY_MODE in PROXY_MODES else "sticky",
+        help="sticky (ports 10000-20000, same IP per ZIP) or rotating (port 823)",
+    )
+    p.add_argument(
+        "--proxy-targeting",
+        choices=list(TARGETING_LEVELS),
+        default=PROXY_TARGETING if PROXY_TARGETING in TARGETING_LEVELS else "country",
+        help="Geo targeting: country (1x) | state|city|zip (2x Target Filters)",
+    )
+    p.add_argument("--proxy", action="append", default=[], help="Static proxy URL override (repeatable)")
     p.add_argument("--json", action="store_true", help="Print JSON to stdout")
     args = p.parse_args(argv)
 
     ensure_dirs()
+    use_proxies = bool(args.proxy) or (args.use_proxy and not args.no_proxy)
 
     def on_progress(info: dict) -> None:
         if info.get("event") == "pipeline_done":
@@ -69,7 +94,9 @@ def main(argv: list[str] | None = None) -> int:
         delay_min=args.delay_min,
         delay_max=args.delay_max,
         proxy_urls=args.proxy,
-        use_proxies=bool(args.proxy),
+        use_proxies=use_proxies,
+        proxy_targeting=args.proxy_targeting if use_proxies else None,
+        proxy_mode=args.proxy_mode if use_proxies else None,
         max_parallel_pipelines=args.max_parallel,
         on_progress=on_progress,
     )

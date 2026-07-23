@@ -22,11 +22,16 @@ from .config import (
     REQUEST_TIMEOUT,
     build_pb,
 )
-from .proxy_manager import ProxyManager
+from .locations import ZipLocation
+from .proxy_manager import ProxyManager, ProxyTarget
 
 
 class BlockedError(RuntimeError):
     """Raised when Google returns a consent/CAPTCHA/block page."""
+
+
+class NoProxyError(RuntimeError):
+    """Raised when DataImpulse has no IPs for the requested geo filter."""
 
 
 class GMapsClient:
@@ -69,6 +74,7 @@ class GMapsClient:
         span: float = DEFAULT_SPAN,
         offset: int = 0,
         use_zip_session: bool = False,
+        location: ZipLocation | None = None,
     ) -> str:
         """
         Perform a Maps search and return raw response text.
@@ -97,9 +103,22 @@ class GMapsClient:
             "psi": psi,
         }
 
+        target = ProxyTarget.from_location(location)
+        self.proxy_manager.reset_level()
+        level = self.proxy_manager.targeting
+        session_key = None
+        if location is not None:
+            session_key = f"{location.country}:{location.zip_code}"
+            if self.proxy_manager.mode == "sticky":
+                self.proxy_manager.begin_sticky_session(session_key)
+
         last_err: Exception | None = None
         for attempt in range(1, MAX_RETRIES + 1):
-            proxy = self.proxy_manager.get_proxy()
+            proxy = self.proxy_manager.get_proxy(
+                target=target,
+                level=level,
+                session_key=session_key,
+            )
             try:
                 resp = self.session.get(
                     GMAPS_SEARCH_URL,
@@ -107,6 +126,20 @@ class GMapsClient:
                     proxies=proxy,
                     timeout=self.timeout,
                 )
+                if self._is_no_ray(resp):
+                    self.proxy_manager.report_failure(proxy)
+                    next_level = self.proxy_manager.next_fallback_level(level)
+                    if next_level:
+                        last_err = NoProxyError(
+                            f"NO_RAY for targeting={level}; falling back to {next_level}"
+                        )
+                        level = next_level
+                        self.proxy_manager.set_level(level)
+                        continue
+                    last_err = NoProxyError("NO_RAY: no proxy IPs for requested geo")
+                    time.sleep(2 ** attempt + random.random())
+                    continue
+
                 if resp.status_code in (429, 503):
                     self.proxy_manager.report_failure(proxy)
                     last_err = BlockedError(f"HTTP {resp.status_code}")
@@ -130,6 +163,13 @@ class GMapsClient:
                 time.sleep(2 ** attempt + random.random())
 
         raise last_err or RuntimeError("Search failed")
+
+    @staticmethod
+    def _is_no_ray(resp: requests.Response) -> bool:
+        if resp.status_code != 400:
+            return False
+        body = (resp.text or "").upper()
+        return "NO_RAY" in body
 
     @staticmethod
     def _decode_body(resp: requests.Response) -> str:

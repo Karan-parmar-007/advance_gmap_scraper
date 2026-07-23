@@ -12,6 +12,7 @@ HTTP scraper for Google Maps local results (no browser). Searches by ZIP/pincode
 - If a location misses its quota, deep-scans every ZIP up to 10 pages each
 - Transfers any remaining shortfall to selected pipelines that still have capacity
 - Dedupes by Maps place id / name+phone
+- DataImpulse residential proxies with geo target filters (`zip` / `city` / `state` / `country`)
 - Extracts: name, phone, website, rating, reviews (when present), address, categories, lat/lng, place id
 - Proxy-ready (`ProxyManager`) for residential rotation later
 
@@ -19,6 +20,37 @@ HTTP scraper for Google Maps local results (no browser). Searches by ZIP/pincode
 
 ```bash
 pip install -r requirements.txt
+cp .env.example .env   # fill in DataImpulse credentials
+```
+
+## Proxies (DataImpulse)
+
+Credentials live in `.env`:
+
+```env
+DATAIMPULSE_LOGIN=...
+DATAIMPULSE_PASSWORD=...
+DATAIMPULSE_HOST=gw.dataimpulse.com
+DATAIMPULSE_PORT=823
+PROXY_ENABLED=true
+PROXY_MODE=sticky
+PROXY_TARGETING=country
+```
+
+| Mode | Port | Behavior |
+|------|------|----------|
+| `sticky` | `10000–20000` | Same IP for all pages of one ZIP |
+| `rotating` | `823` | IP can change every request |
+
+| Targeting | Traffic cost |
+|-----------|--------------|
+| `country` | 1x (recommended) |
+| `state` / `city` / `zip` | 2x Target Filters |
+
+Sticky URL example (country only):
+
+```text
+http://login__cr.us;sessid.united_states_10001:pass@gw.dataimpulse.com:12457
 ```
 
 ## Streamlit UI
@@ -34,6 +66,7 @@ python cli.py plumber --state Illinois --city Chicago --limit 50
 python cli.py "web design" --state TX --limit 100 --per-zip 60
 python cli.py plumber --country "United States" --limit 200
 python cli.py "it companies" --state Illinois --state Massachusetts --limit 600 --max-parallel 2
+python cli.py plumber --state Illinois --city Chicago --limit 50 --use-proxy --proxy-targeting zip
 ```
 
 ## Project layout
@@ -48,8 +81,10 @@ scraper/
   locations.py         # JSON pincode pool filters
   quotas.py            # Hierarchical limit distribution
   runner.py            # Unit/zip loop + limits + export
-  proxy_manager.py     # Direct now; rotation later
+  proxy_manager.py     # DataImpulse residential + target filters
+  runner.py            # Unit/zip loop + limits + export
   models.py / dedupe.py
+.env / .env.example    # Proxy credentials (never commit .env)
 data/                  # location_pincodes.json
 output/                # CSV / XLSX exports
 debug/                 # Failed/raw payloads

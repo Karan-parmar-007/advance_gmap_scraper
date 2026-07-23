@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import os
 import random
 from pathlib import Path
+
+from dotenv import load_dotenv
 
 # Paths
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -11,6 +14,32 @@ DATA_DIR = ROOT_DIR / "data"
 OUTPUT_DIR = ROOT_DIR / "output"
 DEBUG_DIR = ROOT_DIR / "debug"
 LOCATION_JSON_PATH = DATA_DIR / "location_pincodes.json"
+
+# Load project .env once (credentials stay out of source control).
+load_dotenv(ROOT_DIR / ".env")
+
+# DataImpulse residential proxy defaults
+DATAIMPULSE_LOGIN = os.getenv("DATAIMPULSE_LOGIN", "")
+DATAIMPULSE_PASSWORD = os.getenv("DATAIMPULSE_PASSWORD", "")
+DATAIMPULSE_HOST = os.getenv("DATAIMPULSE_HOST", "gw.dataimpulse.com")
+DATAIMPULSE_PORT = int(os.getenv("DATAIMPULSE_PORT", "823") or 823)
+DATAIMPULSE_PROTOCOL = os.getenv("DATAIMPULSE_PROTOCOL", "http")
+PROXY_ENABLED = os.getenv("PROXY_ENABLED", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+PROXY_MODE = (os.getenv("PROXY_MODE", "sticky") or "sticky").strip().lower()
+PROXY_TARGETING = (os.getenv("PROXY_TARGETING", "country") or "country").strip().lower()
+PROXY_FALLBACK = os.getenv("PROXY_FALLBACK", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+DATAIMPULSE_STICKY_PORT_MIN = int(os.getenv("DATAIMPULSE_STICKY_PORT_MIN", "10000") or 10000)
+DATAIMPULSE_STICKY_PORT_MAX = int(os.getenv("DATAIMPULSE_STICKY_PORT_MAX", "20000") or 20000)
 
 # Defaults
 DEFAULT_PER_ZIP_CAP = 20
