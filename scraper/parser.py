@@ -205,19 +205,54 @@ def _extract_website(place: Any) -> tuple[str, str]:
     return found_url, found_domain
 
 
+def _parse_review_count_text(text: str) -> int | None:
+    """Parse strings like '43 reviews' / '1,234 reviews' (incl. thin spaces)."""
+    if not isinstance(text, str):
+        return None
+    cleaned = text.replace("\u202f", "").replace("\xa0", " ").strip()
+    m = re.search(r"([\d,]+)\s+reviews?", cleaned, re.I)
+    if not m:
+        return None
+    try:
+        return int(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+
+
 def _extract_rating(place: Any) -> tuple[float | None, int | None]:
+    """
+    Rating / review_count extraction.
+
+    Rating always lives at place[4][7].
+
+    Review count location depends on response format:
+      - Compact HTTP responses: place[37][1]  (primary — most common)
+      - Rich browser responses:  place[4][8]   (fallback)
+      - Text embedded:           "N reviews" string inside place[4][3]
+    """
     rating = safe_get(place, 4, 7)
     reviews = safe_get(place, 4, 8)
-    # Alternate: text like "345 reviews" at [4][3][1]
+
+    # Primary review count path for compact HTTP responses: place[37][1]
+    # Google puts the total review count here even when place[4][8] is null.
     if reviews is None:
-        review_text = safe_get(place, 4, 3, 1)
-        if isinstance(review_text, str):
-            m = re.search(r"([\d,]+)", review_text.replace("\u202f", "").replace(",", ""))
-            if m:
-                try:
-                    reviews = int(m.group(1).replace(",", ""))
-                except ValueError:
-                    reviews = None
+        candidate = safe_get(place, 37, 1)
+        if isinstance(candidate, int) and candidate > 0:
+            reviews = candidate
+        elif isinstance(candidate, float) and candidate > 0 and candidate == int(candidate):
+            reviews = int(candidate)
+
+    # Text under [4][3] (shape varies: index 0 may be null or a reviews URL)
+    if reviews is None:
+        block3 = safe_get(place, 4, 3)
+        if isinstance(block3, list):
+            for item in block3:
+                parsed = _parse_review_count_text(item) if isinstance(item, str) else None
+                if parsed is not None:
+                    reviews = parsed
+                    break
+        elif isinstance(block3, str):
+            reviews = _parse_review_count_text(block3)
 
     # Some responses only include the float rating under [4][7]
     if rating is None:
@@ -231,13 +266,10 @@ def _extract_rating(place: Any) -> tuple[float | None, int | None]:
     # Scan for "N reviews" anywhere shallow if still missing
     if reviews is None:
         for s in _find_strings(place, max_depth=5, limit=80):
-            m = re.search(r"^([\d,]+)\s+reviews?$", s.replace("\u202f", ""), re.I)
-            if m:
-                try:
-                    reviews = int(m.group(1).replace(",", ""))
-                    break
-                except ValueError:
-                    pass
+            parsed = _parse_review_count_text(s)
+            if parsed is not None:
+                reviews = parsed
+                break
 
     try:
         rating_f = float(rating) if rating is not None else None
@@ -317,51 +349,6 @@ def _extract_coords(place: Any) -> tuple[float | None, float | None]:
     return lat_f, lng_f
 
 
-def _extract_hours(place: Any) -> str:
-    """Best-effort hours summary string."""
-    # Look for blocks containing day names
-    days = {"Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"}
-    snippets: list[str] = []
-
-    def walk(node: Any, depth: int = 0) -> None:
-        if depth > 14 or len(snippets) >= 7:
-            return
-        if isinstance(node, list) and len(node) >= 4:
-            day = node[0]
-            if isinstance(day, str) and day in days:
-                # node[3] often [["Open 24 hours", ...]] or [["Closed"]]
-                status = safe_get(node, 3, 0, 0)
-                if isinstance(status, str):
-                    snippets.append(f"{day}: {status}")
-                    return
-        if isinstance(node, list):
-            for item in node[:50]:
-                walk(item, depth + 1)
-
-    walk(place)
-    # Prefer status line if present
-    status_line = ""
-
-    def walk_status(node: Any, depth: int = 0) -> None:
-        nonlocal status_line
-        if depth > 12 or status_line:
-            return
-        if isinstance(node, str) and (
-            node.startswith("Open") or node.startswith("Closed") or "·" in node
-        ):
-            if len(node) < 80 and ("Open" in node or "Closed" in node):
-                status_line = node
-                return
-        if isinstance(node, list):
-            for item in node[:40]:
-                walk_status(item, depth + 1)
-
-    walk_status(place)
-    if snippets:
-        return "; ".join(snippets[:7])
-    return status_line
-
-
 def parse_place(
     place: Any,
     *,
@@ -405,7 +392,8 @@ def parse_place(
     rating, review_count = _extract_rating(place)
     addr = _extract_address(place)
     lat, lng = _extract_coords(place)
-    hours = _extract_hours(place)
+    timezone = _extract_timezone(place)
+    cid = _extract_cid(place)
 
     if not name:
         # Last resort: full address field sometimes starts with name
@@ -434,12 +422,31 @@ def parse_place(
         longitude=lng,
         place_id=place_id,
         kg_mid=kg_mid,
-        hours_text=hours,
+        timezone=timezone,
+        cid=cid,
         search_term=search_term,
         search_zip=search_zip,
         search_city=search_city,
         search_state=search_state,
     )
+
+
+def _extract_timezone(place: Any) -> str:
+    tz = safe_get(place, 30)
+    if isinstance(tz, str) and "/" in tz and len(tz) < 60:
+        return tz
+    return ""
+
+
+def _extract_cid(place: Any) -> str:
+    """Google CID / feature owner ids when present."""
+    for idx in (5, 6):
+        val = safe_get(place, 181, idx)
+        if isinstance(val, str) and val.isdigit() and len(val) >= 10:
+            return val
+        if isinstance(val, int) and val > 10_000_000:
+            return str(val)
+    return ""
 
 
 def _find_strings(node: Any, max_depth: int = 8, limit: int = 200) -> list[str]:

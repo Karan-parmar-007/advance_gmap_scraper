@@ -45,7 +45,8 @@ DATAIMPULSE_STICKY_PORT_MAX = int(os.getenv("DATAIMPULSE_STICKY_PORT_MAX", "2000
 DEFAULT_PER_ZIP_CAP = 20
 PAGE_SIZE = 20
 MAX_PAGES_PER_ZIP = 10
-MIN_CITY_QUOTA = 20
+# Split state quota across cities whenever each city gets at least this many.
+MIN_CITY_QUOTA = 1
 INTRA_ZIP_DELAY_MIN = 1.0
 INTRA_ZIP_DELAY_MAX = 3.0
 DEFAULT_DELAY_MIN = 2.0
@@ -54,6 +55,9 @@ DEFAULT_HL = "en"
 DEFAULT_GL = "us"
 MAX_RETRIES = 3
 REQUEST_TIMEOUT = 30
+MAX_DISCOVERY_WORKERS = 32
+# How many company rows to send to the Streamlit UI (full data stays on disk).
+UI_PREVIEW_ROWS = 100
 
 # Chrome-like headers
 DEFAULT_HEADERS = {
@@ -86,11 +90,12 @@ DEFAULT_LAT = 39.8283
 DEFAULT_LNG = -98.5795
 DEFAULT_SPAN = 50_000.0  # meters viewport span
 
-# pb template from captured Maps search. Placeholders: {span}, {lng}, {lat}
+# pb template from captured Maps search (Jul 2026). Placeholders: {span}, {lng}, {lat}, {offset}
 # Most feature flags are kept verbatim so Google returns the same rich payload.
+# Screen size / panel layout / 69i787 aligned to a live browser capture that includes review counts.
 PB_TEMPLATE = (
     "!4m12!1m3!1d{span}!2d{lng}!3d{lat}"
-    "!2m3!1f0!2f0!3f0!3m2!1i1024!2i768!4f13.1!7i20!8i{offset}!10b1"
+    "!2m3!1f0!2f0!3f0!3m2!1i1009!2i936!4f13.1!7i20!8i{offset}!10b1"
     "!12m26!1m5!18b1!30b1!31m1!1b1!34e1!2m4!5m1!6e2!20e3!39b1"
     "!10b1!12b1!13b1!16b1!17m1!3e1!20m4!5e2!6b1!8b1!14b1!46m1!1b0"
     "!96b1!99b1!19m4!2m3!1i360!2i120!4i8"
@@ -111,11 +116,15 @@ PB_TEMPLATE = (
     "!3sother_user_google_review_posts__and__hotel_and_vr_partner_review_posts"
     "!6m1!1e1!9b1!89b1!90m2!1m1!1e2!98m3!1b1!2b1!3b1!103b1!113b1"
     "!114m3!1b1!2m1!1b1!117b1!122m1!1b1!126b1!127b1!128m1!1b0"
-    "!26m4!2m3!1i80!2i92!4i8!30m0"
+    "!26m4!2m3!1i80!2i92!4i8"
+    "!30m28!1m6!1m2!1i0!2i0!2m2!1i530!2i936"
+    "!1m6!1m2!1i959!2i0!2m2!1i1009!2i936"
+    "!1m6!1m2!1i0!2i0!2m2!1i1009!2i20"
+    "!1m6!1m2!1i0!2i916!2m2!1i1009!2i936"
     "!34m19!2b1!3b1!4b1!6b1!8m6!1b1!3b1!4b1!5b1!6b1!7b1"
     "!9b1!12b1!14b1!20b1!23b1!25b1!26b1!31b1"
     "!37m1!1e81!42b1!47m0!49m10!3b1!6m2!1b1!2b1!7m2!1e3!2b1!8b1!9b1!10e2"
-    "!50m4!2e2!3m2!1b1!3b1!67m5!7b1!10b1!14b1!15m1!1b0!69i786!77b1"
+    "!50m4!2e2!3m2!1b1!3b1!67m5!7b1!10b1!14b1!15m1!1b0!69i787!77b1"
 )
 
 GMAPS_SEARCH_URL = "https://www.google.com/search"
@@ -128,6 +137,21 @@ def build_pb(
     offset: int = 0,
 ) -> str:
     return PB_TEMPLATE.format(span=span, lng=lng, lat=lat, offset=max(0, int(offset)))
+
+
+def auto_discovery_workers(
+    limit: int,
+    pipeline_count: int,
+    per_zip_cap: int = DEFAULT_PER_ZIP_CAP,
+) -> int:
+    """Default discovery concurrency from company limit and expected yield per ZIP."""
+    if pipeline_count <= 0:
+        return 1
+    if limit <= 0:
+        return min(pipeline_count, 16)
+    per_zip = max(1, int(per_zip_cap or DEFAULT_PER_ZIP_CAP))
+    suggested = max(1, (int(limit) + per_zip - 1) // per_zip)
+    return min(pipeline_count, suggested, MAX_DISCOVERY_WORKERS)
 
 
 def random_delay(min_s: float = DEFAULT_DELAY_MIN, max_s: float = DEFAULT_DELAY_MAX) -> float:
