@@ -102,15 +102,28 @@ class GMapsClient:
             "ech": str(ech),
             "psi": psi,
         }
+        return self._request(
+            GMAPS_SEARCH_URL,
+            params,
+            location=location,
+            session_key=(
+                f"{location.country}:{location.zip_code}" if location is not None else None
+            ),
+        )
 
+    def _request(
+        self,
+        url: str,
+        params: dict[str, Any],
+        *,
+        location: ZipLocation | None = None,
+        session_key: str | None = None,
+    ) -> str:
         target = ProxyTarget.from_location(location)
         self.proxy_manager.reset_level()
         level = self.proxy_manager.targeting
-        session_key = None
-        if location is not None:
-            session_key = f"{location.country}:{location.zip_code}"
-            if self.proxy_manager.mode == "sticky":
-                self.proxy_manager.begin_sticky_session(session_key)
+        if session_key and self.proxy_manager.mode == "sticky":
+            self.proxy_manager.begin_sticky_session(session_key)
 
         last_err: Exception | None = None
         for attempt in range(1, MAX_RETRIES + 1):
@@ -121,7 +134,7 @@ class GMapsClient:
             )
             try:
                 resp = self.session.get(
-                    GMAPS_SEARCH_URL,
+                    url,
                     params=params,
                     proxies=proxy,
                     timeout=self.timeout,
@@ -177,7 +190,6 @@ class GMapsClient:
         encoding = (resp.headers.get("Content-Encoding") or "").lower()
         content = resp.content or b""
 
-        # If requests already decoded (text looks like JSON), use it
         preview = content[:20]
         if preview.startswith(b"{") or preview.startswith(b")]}'") or preview.startswith(b"[["):
             return content.decode(resp.encoding or "utf-8", errors="replace")
@@ -188,7 +200,6 @@ class GMapsClient:
 
                 content = brotli.decompress(content)
             except Exception:
-                # Fall through — may already be decoded by urllib3
                 pass
 
         if resp.encoding:
@@ -197,9 +208,13 @@ class GMapsClient:
 
     @staticmethod
     def _make_psi() -> str:
-        # Session-ish token; Google accepts arbitrary-looking values
         stamp = int(time.time() * 1000)
-        rand = "".join(random.choices("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_", k=22))
+        rand = "".join(
+            random.choices(
+                "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_",
+                k=22,
+            )
+        )
         return f"{rand}.{stamp}.1"
 
     @staticmethod
@@ -207,13 +222,11 @@ class GMapsClient:
         if not text or len(text) < 50:
             return True
         low = text[:2000].lower()
-        # Healthy responses are JSON wrappers or )]}' arrays
         stripped = text.lstrip()
         if stripped.startswith("{") and '"d"' in stripped[:500]:
             return False
         if stripped.startswith(")]}'") or stripped.startswith("[["):
             return False
-        # Block / consent signals
         markers = (
             "unusual traffic",
             "detected unusual traffic",

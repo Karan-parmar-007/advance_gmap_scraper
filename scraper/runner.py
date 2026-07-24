@@ -1,4 +1,4 @@
-"""Concurrent, quota-aware orchestration for ZIP-based Maps scraping."""
+"""Concurrent city-level discovery pipelines (Maps search API)."""
 
 from __future__ import annotations
 
@@ -24,6 +24,8 @@ from .config import (
     MAX_PAGES_PER_ZIP,
     OUTPUT_DIR,
     PAGE_SIZE,
+    UI_PREVIEW_ROWS,
+    auto_discovery_workers,
     ensure_dirs,
     random_delay,
 )
@@ -48,6 +50,7 @@ class RunStats:
     pipelines_total: int = 0
     pipelines_active: int = 0
     companies_found: int = 0
+    discovery_workers: int = 0
     last_zip: str = ""
     last_count: int = 0
     current_unit: str = ""
@@ -89,6 +92,7 @@ class PipelineProgress:
     label: str
     country: str
     state: str
+    city: str
     locations: list[LocationProgress]
     target: int
     collected: int = 0
@@ -122,11 +126,12 @@ class ScraperRunner:
         proxy_targeting: str | None = None,
         proxy_fallback: bool | None = None,
         proxy_mode: str | None = None,
-        max_parallel_pipelines: int = 4,
+        max_parallel_pipelines: int | None = None,
+        max_discovery_workers: int = 0,
         on_progress: ProgressCallback | None = None,
         should_stop: Callable[[], bool] | None = None,
     ) -> None:
-        self.search_term = search_term.strip()
+        self.search_term = (search_term or "").strip()
         self.countries = countries or []
         self.states = states or []
         self.cities = cities or []
@@ -139,7 +144,9 @@ class ScraperRunner:
         self.proxy_targeting = proxy_targeting
         self.proxy_fallback = proxy_fallback
         self.proxy_mode = proxy_mode
-        self.max_parallel_pipelines = max(1, int(max_parallel_pipelines))
+        if max_parallel_pipelines is not None and max_discovery_workers <= 0:
+            max_discovery_workers = int(max_parallel_pipelines)
+        self.max_discovery_workers = max(0, int(max_discovery_workers or 0))
         self.on_progress = on_progress
         self.should_stop = should_stop or (lambda: False)
 
@@ -149,6 +156,7 @@ class ScraperRunner:
         self._events: queue.Queue[dict] = queue.Queue()
         self._stats_lock = threading.Lock()
         self._used_zip_keys: set[tuple[str, str, str, str]] = set()
+        self._pipelines_by_id: dict[str, PipelineProgress] = {}
         ensure_dirs()
 
     def run(self) -> list[Company]:
@@ -160,14 +168,25 @@ class ScraperRunner:
             countries=self.countries or None,
             states=self.states or None,
             cities=self.cities or None,
+            per_zip_cap=self.per_zip_cap,
         )
         self.pipelines = self._build_pipelines(units)
+        self._pipelines_by_id = {p.pipeline_id: p for p in self.pipelines}
         self.stats.pipelines_total = len(self.pipelines)
         self.stats.zips_total = sum(
             len(location.zips)
             for pipeline in self.pipelines
             for location in pipeline.locations
         )
+
+        discovery_n = self.max_discovery_workers or auto_discovery_workers(
+            self.limit,
+            len(self.pipelines),
+            per_zip_cap=self.per_zip_cap,
+        )
+        discovery_n = max(1, min(discovery_n, max(1, len(self.pipelines))))
+        self.stats.discovery_workers = discovery_n
+
         self.stats.status = "running"
         self._emit({"event": "run_start"})
 
@@ -177,18 +196,17 @@ class ScraperRunner:
             self._emit()
             return []
 
-        worker_count = min(self.max_parallel_pipelines, len(self.pipelines))
         try:
             with ThreadPoolExecutor(
-                max_workers=worker_count,
+                max_workers=discovery_n,
                 thread_name_prefix="maps-pipeline",
-            ) as executor:
+            ) as discovery_executor:
                 self._run_parallel_phase(
-                    executor,
+                    discovery_executor,
                     self.pipelines,
                     phase="initial",
                 )
-                self._redistribute_shortfall(executor)
+                self._redistribute_shortfall(discovery_executor)
 
             if self.should_stop():
                 self.stats.stopped = True
@@ -209,39 +227,25 @@ class ScraperRunner:
         return self.store.snapshot()
 
     def _build_pipelines(self, units: list[GeoUnit]) -> list[PipelineProgress]:
-        """Group city units into one worker pipeline per state (or country)."""
-        grouped: dict[tuple[str, str], list[GeoUnit]] = {}
-        for unit in units:
-            state_key = unit.state or "__country__"
-            grouped.setdefault((unit.country, state_key), []).append(unit)
-
+        """One discovery worker pipeline per GeoUnit (city when split)."""
         pipelines: list[PipelineProgress] = []
-        for index, ((country, state_key), grouped_units) in enumerate(
-            sorted(grouped.items(), key=lambda item: item[0])
+        for index, unit in enumerate(
+            sorted(units, key=lambda u: (u.country, u.state, u.city or ""))
         ):
-            state = "" if state_key == "__country__" else grouped_units[0].state
-            state_abbr = grouped_units[0].state_abbr
-            label = (
-                f"{state_abbr or state} ({country})"
-                if state
-                else (country or "All selected locations")
+            location = LocationProgress(
+                unit=unit,
+                zips=[ZipProgress(loc=loc) for loc in unit.zips],
+                target=unit.quota,
             )
-            locations = [
-                LocationProgress(
-                    unit=unit,
-                    zips=[ZipProgress(loc=loc) for loc in unit.zips],
-                    target=unit.quota,
-                )
-                for unit in grouped_units
-            ]
             pipelines.append(
                 PipelineProgress(
                     pipeline_id=f"pipeline-{index + 1}",
-                    label=label,
-                    country=country,
-                    state=state,
-                    locations=locations,
-                    target=sum(unit.quota for unit in grouped_units),
+                    label=unit.label(),
+                    country=unit.country,
+                    state=unit.state,
+                    city=unit.city or "",
+                    locations=[location],
+                    target=unit.quota,
                 )
             )
         return pipelines
@@ -252,19 +256,17 @@ class ScraperRunner:
         pipelines: list[PipelineProgress],
         *,
         phase: str,
-    ) -> int:
+    ) -> None:
         if not pipelines:
-            return 0
-
-        before = len(self.store)
-        futures: dict[Future[int], PipelineProgress] = {
+            return
+        futures = {
             executor.submit(self._run_pipeline, pipeline, phase): pipeline
             for pipeline in pipelines
         }
         pending = set(futures)
         while pending:
-            done, pending = wait(pending, timeout=0.15, return_when=FIRST_COMPLETED)
             self._drain_events()
+            done, pending = wait(pending, timeout=0.4, return_when=FIRST_COMPLETED)
             for future in done:
                 pipeline = futures[future]
                 try:
@@ -276,35 +278,32 @@ class ScraperRunner:
                         pipeline.errors.append(str(exc))
                         pipeline.active = False
                     self._record_error(message)
-        self._drain_events()
-        return len(self.store) - before
 
     def _redistribute_shortfall(self, executor: ThreadPoolExecutor) -> None:
         """Move unmet quota to any selected pipeline that still has capacity."""
-        if not self.limit or self.should_stop():
+        if self.limit <= 0 or self.should_stop():
             return
-
         round_number = 0
-        while len(self.store) < self.limit and not self.should_stop():
+        while not self.should_stop() and len(self.store) < self.limit:
+            remaining = self.limit - len(self.store)
             candidates = [pipeline for pipeline in self.pipelines if not pipeline.exhausted]
-            if not candidates:
+            if not candidates or remaining <= 0:
                 break
-
-            needed = self.limit - len(self.store)
-            allocations = divide_evenly(needed, len(candidates))
-            if not any(allocations):
-                break
-
             round_number += 1
             self.stats.redistribution_round = round_number
-            allocation_payload: list[dict] = []
+            allocations = divide_evenly(remaining, len(candidates))
+            bumped: list[PipelineProgress] = []
+            allocation_info: list[dict] = []
             for pipeline, extra in zip(candidates, allocations):
                 if extra <= 0:
                     continue
                 with pipeline.lock:
                     pipeline.target += extra
                     pipeline.shortfall = max(0, pipeline.target - pipeline.collected)
-                allocation_payload.append(
+                    pipeline.exhausted = False
+                    pipeline.status = "redistributed"
+                bumped.append(pipeline)
+                allocation_info.append(
                     {
                         "pipeline_id": pipeline.pipeline_id,
                         "label": pipeline.label,
@@ -312,30 +311,25 @@ class ScraperRunner:
                         "new_target": pipeline.target,
                     }
                 )
-
-            self.stats.status = f"redistributing {needed} remaining companies"
+            if not bumped:
+                break
             self._emit(
                 {
                     "event": "redistribution_start",
                     "round": round_number,
-                    "remaining": needed,
-                    "allocations": allocation_payload,
+                    "remaining": remaining,
+                    "allocations": allocation_info,
                 }
             )
-            added = self._run_parallel_phase(
-                executor,
-                candidates,
-                phase=f"redistribution-{round_number}",
-            )
+            self._run_parallel_phase(executor, bumped, phase="redistribution")
             self._emit(
                 {
                     "event": "redistribution_done",
                     "round": round_number,
-                    "added": added,
-                    "remaining": max(0, self.limit - len(self.store)),
+                    "companies_found": len(self.store),
                 }
             )
-            if added == 0:
+            if all(p.exhausted for p in bumped):
                 break
 
     def _run_pipeline(self, pipeline: PipelineProgress, phase: str) -> int:
@@ -345,19 +339,7 @@ class ScraperRunner:
             pipeline.status = "running" if phase == "initial" else "redistributed"
         self._queue_pipeline_event("pipeline_start", pipeline, phase=phase)
 
-        proxy_manager = ProxyManager.from_env(
-            enabled=self.use_proxies,
-            targeting=self.proxy_targeting,
-            fallback=self.proxy_fallback,
-            mode=self.proxy_mode,
-        )
-        if self.proxy_urls:
-            proxy_manager.proxies = list(self.proxy_urls)
-            proxy_manager.enable_rotation = self.use_proxies and bool(self.proxy_urls)
-            # Explicit static URLs override DataImpulse auto URL generation.
-            if self.proxy_urls and not proxy_manager.configured:
-                proxy_manager.enabled = False
-        client = GMapsClient(proxy_manager=proxy_manager)
+        client = GMapsClient(proxy_manager=self._make_proxy_manager())
         try:
             self._fill_original_location_quotas(pipeline, client)
             self._fill_pipeline_target(pipeline, client)
@@ -366,47 +348,56 @@ class ScraperRunner:
             with pipeline.lock:
                 pipeline.active = False
                 pipeline.shortfall = max(0, pipeline.target - pipeline.collected)
-                if pipeline.collected >= pipeline.target:
+                if pipeline.collected >= pipeline.target and pipeline.target > 0:
                     pipeline.status = "target reached"
                 elif pipeline.exhausted:
                     pipeline.status = "exhausted"
                 else:
                     pipeline.status = "waiting"
-            if phase != "initial":
-                pipeline.redistribution_added += pipeline.collected - before
+                if phase == "redistribution":
+                    pipeline.redistribution_added += pipeline.collected - before
             self._queue_pipeline_event("pipeline_done", pipeline, phase=phase)
         return pipeline.collected - before
+
+    def _make_proxy_manager(self) -> ProxyManager:
+        proxy_manager = ProxyManager.from_env(
+            enabled=self.use_proxies,
+            targeting=self.proxy_targeting,
+            fallback=self.proxy_fallback,
+            mode=self.proxy_mode,
+        )
+        if self.proxy_urls:
+            proxy_manager.proxies = list(self.proxy_urls)
+            if self.proxy_urls and not proxy_manager.configured:
+                proxy_manager.enabled = False
+        return proxy_manager
 
     def _fill_original_location_quotas(
         self,
         pipeline: PipelineProgress,
         client: GMapsClient,
     ) -> None:
-        """Honor the country/state/city allocation before using spare capacity."""
         for location in pipeline.locations:
             if self._must_stop(pipeline):
                 return
-            if location.target <= 0 or location.collected >= location.target:
+            if location.target <= 0 and self.limit > 0:
                 continue
-            self._scrape_location(
-                pipeline,
-                location,
-                client,
-                target=location.target,
-            )
+            target = location.target if location.target > 0 else 10**9
+            self._scrape_location(pipeline, location, client, target=target)
 
     def _fill_pipeline_target(
         self,
         pipeline: PipelineProgress,
         client: GMapsClient,
     ) -> None:
-        """Use any remaining location capacity to cover local or transferred gaps."""
         while pipeline.collected < pipeline.target and not self._must_stop(pipeline):
+            if pipeline.target <= 0 and self.limit <= 0:
+                # Unlimited: one pass over locations is enough
+                break
             candidates = [location for location in pipeline.locations if not location.exhausted]
             if not candidates:
                 pipeline.exhausted = True
-                return
-
+                break
             round_before = pipeline.collected
             for location in candidates:
                 if self._must_stop(pipeline) or pipeline.collected >= pipeline.target:
@@ -420,7 +411,12 @@ class ScraperRunner:
             if pipeline.collected == round_before:
                 if all(location.exhausted for location in pipeline.locations):
                     pipeline.exhausted = True
-                return
+                break
+
+        if self.limit <= 0:
+            # Unlimited: mark exhausted when locations are done
+            if all(location.exhausted for location in pipeline.locations):
+                pipeline.exhausted = True
 
     def _scrape_location(
         self,
@@ -434,20 +430,24 @@ class ScraperRunner:
             zip_progress = self._next_zip(location)
             if zip_progress is None:
                 location.exhausted = True
-                return
+                break
 
-            normal_cap = self.per_zip_cap
-            deep_cap = PAGE_SIZE * MAX_PAGES_PER_ZIP
-            zip_cap = deep_cap if location.deep_scan else normal_cap
             remaining = min(
                 target - location.collected,
-                pipeline.target - pipeline.collected,
+                pipeline.target - pipeline.collected if pipeline.target > 0 else 10**9,
             )
+            if self.limit > 0:
+                remaining = min(remaining, self.limit - len(self.store))
             if remaining <= 0:
-                return
+                break
 
+            zip_cap = self.per_zip_cap if not location.deep_scan else PAGE_SIZE * MAX_PAGES_PER_ZIP
             try:
-                added = self._consume_or_fetch_page(
+                if zip_progress.pages > 0 or zip_progress.started:
+                    time.sleep(random_delay(INTRA_ZIP_DELAY_MIN, INTRA_ZIP_DELAY_MAX))
+                else:
+                    time.sleep(random_delay(self.delay_min, self.delay_max))
+                self._consume_or_fetch_page(
                     pipeline,
                     location,
                     zip_progress,
@@ -460,34 +460,31 @@ class ScraperRunner:
                 pipeline.errors.append(str(exc))
                 self._record_error(message)
                 zip_progress.no_more_pages = True
-                time.sleep(random_delay(8, 15))
-                continue
+                client.end_zip_session()
+                time.sleep(random.uniform(8, 15))
             except Exception as exc:
                 message = f"Error on {pipeline.label} ZIP {zip_progress.loc.zip_code}: {exc}"
                 pipeline.errors.append(str(exc))
                 self._record_error(message)
                 zip_progress.no_more_pages = True
-                continue
+                client.end_zip_session()
 
-            if added == 0 and not zip_progress.pending and zip_progress.no_more_pages:
-                continue
+            if not self._zip_can_continue(zip_progress, zip_cap):
+                client.end_zip_session()
+                location.cursor += 1
+
             if location.collected < target and not self._must_stop(pipeline):
-                delay_min = INTRA_ZIP_DELAY_MIN if self._zip_can_continue(
-                    zip_progress, zip_cap
-                ) else self.delay_min
-                delay_max = INTRA_ZIP_DELAY_MAX if self._zip_can_continue(
-                    zip_progress, zip_cap
-                ) else self.delay_max
-                time.sleep(random_delay(delay_min, delay_max))
+                if location.cursor >= len(location.zips) and not location.deep_scan:
+                    # Will flip to deep scan on next _next_zip call
+                    pass
 
     def _next_zip(self, location: LocationProgress) -> ZipProgress | None:
-        """Return the next usable ZIP; deep-scan every ZIP after normal pass."""
-        normal_cap = self.per_zip_cap
         deep_cap = PAGE_SIZE * MAX_PAGES_PER_ZIP
-        cap = deep_cap if location.deep_scan else normal_cap
+        normal_cap = self.per_zip_cap
 
         while location.cursor < len(location.zips):
             progress = location.zips[location.cursor]
+            cap = deep_cap if location.deep_scan else normal_cap
             if self._zip_can_continue(progress, cap):
                 return progress
             location.cursor += 1
@@ -536,7 +533,8 @@ class ScraperRunner:
         while progress.pending and allowed > 0:
             batch = progress.pending[:allowed]
             del progress.pending[: len(batch)]
-            added = self.store.add_many(batch, max_total=self.limit)
+            accepted = self.store.add_many(batch, max_total=self.limit)
+            added = len(accepted)
             progress.zip_added += added
             location.collected += added
             pipeline.collected += added
@@ -549,23 +547,21 @@ class ScraperRunner:
             return added_total
 
         loc = progress.loc
-        query = f"{self.search_term} {loc.zip_code}"
+        query = f"{self.search_term} {loc.zip_code}".strip()
         pipeline.current_zip = loc.zip_code
         if not progress.started:
             progress.started = True
             pipeline.zips_used += 1
             self._mark_zip_used(loc)
+            # One Maps + sticky proxy session for all pages of this ZIP.
+            client.begin_zip_session()
 
-        client.begin_zip_session()
-        try:
-            raw = client.search(
-                query,
-                offset=progress.offset,
-                use_zip_session=True,
-                location=loc,
-            )
-        finally:
-            client.end_zip_session()
+        raw = client.search(
+            query,
+            offset=progress.offset,
+            use_zip_session=True,
+            location=loc,
+        )
 
         companies = parse_response(
             raw,
@@ -576,23 +572,24 @@ class ScraperRunner:
             per_zip_cap=PAGE_SIZE,
             debug_dir=DEBUG_DIR,
         )
-        returned = len(companies)
+        raw_returned = len(companies)
         page_offset = progress.offset
         progress.offset += PAGE_SIZE
         progress.pages += 1
         progress.pending.extend(companies)
         pipeline.pages_fetched += 1
         pipeline.requests_made += 1
-        self._record_request(loc, returned)
+        self._record_request(loc, raw_returned)
 
-        if returned < PAGE_SIZE or progress.pages >= MAX_PAGES_PER_ZIP:
+        if raw_returned < PAGE_SIZE or progress.pages >= MAX_PAGES_PER_ZIP:
             progress.no_more_pages = True
 
         before = added_total
         while progress.pending and allowed > 0:
             batch = progress.pending[:allowed]
             del progress.pending[: len(batch)]
-            added = self.store.add_many(batch, max_total=self.limit)
+            accepted = self.store.add_many(batch, max_total=self.limit)
+            added = len(accepted)
             progress.zip_added += added
             location.collected += added
             pipeline.collected += added
@@ -608,7 +605,8 @@ class ScraperRunner:
             city=loc.city,
             page=progress.pages,
             offset=page_offset,
-            returned=returned,
+            returned=raw_returned,
+            kept=len(companies),
             added=added_total - before,
             zip_total=progress.zip_added,
             location=location.label(),
@@ -617,11 +615,13 @@ class ScraperRunner:
         return added_total
 
     def _must_stop(self, pipeline: PipelineProgress) -> bool:
-        return (
-            self.should_stop()
-            or (self.limit > 0 and len(self.store) >= self.limit)
-            or pipeline.collected >= pipeline.target
-        )
+        if self.should_stop():
+            return True
+        if self.limit > 0 and len(self.store) >= self.limit:
+            return True
+        if pipeline.target > 0 and pipeline.collected >= pipeline.target:
+            return True
+        return False
 
     def _mark_zip_used(self, loc: ZipLocation) -> None:
         key = (loc.country, loc.state, loc.city, loc.zip_code)
@@ -670,6 +670,7 @@ class ScraperRunner:
                 "label": pipeline.label,
                 "country": pipeline.country,
                 "state": pipeline.state,
+                "city": pipeline.city,
                 "target": pipeline.target,
                 "collected": pipeline.collected,
                 "shortfall": max(0, pipeline.target - pipeline.collected),
@@ -709,6 +710,7 @@ class ScraperRunner:
             "pipelines_total": self.stats.pipelines_total,
             "pipelines_active": self.stats.pipelines_active,
             "companies_found": len(self.store),
+            "discovery_workers": self.stats.discovery_workers,
             "last_zip": self.stats.last_zip,
             "last_count": self.stats.last_count,
             "current_unit": self.stats.current_unit,
@@ -718,7 +720,11 @@ class ScraperRunner:
             "finished": self.stats.finished,
             "redistribution_round": self.stats.redistribution_round,
             "pipelines": pipeline_info,
-            "companies": self.store.snapshot(),
+            # Preview only — full snapshots blow up the Streamlit/browser tab.
+            "companies_preview": [
+                company.to_dict() for company in self.store.snapshot()[-UI_PREVIEW_ROWS:]
+            ],
+            "with_reviews": self.store.with_reviews_count(),
         }
         if extra:
             payload.update(extra)

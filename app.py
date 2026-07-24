@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
-from io import BytesIO
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -15,11 +15,15 @@ from scraper.config import (
     DEFAULT_DELAY_MAX,
     DEFAULT_DELAY_MIN,
     DEFAULT_PER_ZIP_CAP,
+    MAX_DISCOVERY_WORKERS,
     MAX_PAGES_PER_ZIP,
+    OUTPUT_DIR,
     PAGE_SIZE,
     PROXY_ENABLED,
     PROXY_MODE,
     PROXY_TARGETING,
+    UI_PREVIEW_ROWS,
+    auto_discovery_workers,
     ensure_dirs,
 )
 from scraper.locations import list_cities, list_countries, list_states
@@ -44,7 +48,11 @@ class RunState:
     stop_event: threading.Event = field(default_factory=threading.Event)
     running: bool = False
     progress: dict[str, Any] = field(default_factory=dict)
-    results: list = field(default_factory=list)
+    results: list = field(default_factory=list)  # UI preview only
+    companies_total: int = 0
+    with_reviews: int = 0
+    csv_path: str = ""
+    xlsx_path: str = ""
     logs: list[str] = field(default_factory=list)
     run_error: str = ""
     run_message: str = ""
@@ -61,6 +69,10 @@ class RunState:
                 "running": self.running,
                 "progress": dict(self.progress),
                 "results": list(self.results),
+                "companies_total": self.companies_total,
+                "with_reviews": self.with_reviews,
+                "csv_path": self.csv_path,
+                "xlsx_path": self.xlsx_path,
                 "logs": list(self.logs),
                 "run_error": self.run_error,
                 "run_message": self.run_message,
@@ -113,14 +125,14 @@ def pipelines_to_df(pipelines: list[dict]) -> pd.DataFrame:
 def make_progress_callback(run_state: RunState):
     def on_progress(info: dict) -> None:
         with run_state.lock:
-            # Keep UI updates light: store company rows only as plain dicts.
-            companies = info.get("companies") or []
-            if companies and hasattr(companies[0], "to_dict"):
-                companies = [company.to_dict() for company in companies]
-            payload = dict(info)
-            payload["companies"] = companies
+            preview = info.get("companies_preview") or []
+            if preview and hasattr(preview[0], "to_dict"):
+                preview = [company.to_dict() for company in preview]
+            payload = {k: v for k, v in info.items() if k != "companies_preview"}
             run_state.progress = payload
-            run_state.results = companies
+            run_state.results = list(preview)[-UI_PREVIEW_ROWS:]
+            run_state.companies_total = int(info.get("companies_found") or 0)
+            run_state.with_reviews = int(info.get("with_reviews") or 0)
 
             event = info.get("event")
             if event == "pipeline_done":
@@ -147,10 +159,12 @@ def make_progress_callback(run_state: RunState):
             elif event == "run_start":
                 pipelines = info.get("pipelines") or []
                 run_state.logs.append(
-                    f"Starting {len(pipelines)} pipeline(s): "
+                    f"Starting {len(pipelines)} pipeline(s) · "
+                    f"discovery×{info.get('discovery_workers')}: "
                     + ", ".join(
-                        f"{p.get('label')}={p.get('target')}" for p in pipelines
+                        f"{p.get('label')}={p.get('target')}" for p in pipelines[:12]
                     )
+                    + ("…" if len(pipelines) > 12 else "")
                 )
             run_state.logs = run_state.logs[-300:]
 
@@ -163,8 +177,10 @@ def render_progress(
     total_target: int,
     results: list,
     logs: list[str],
+    companies_total: int = 0,
+    with_reviews: int = 0,
 ) -> None:
-    found = int(info.get("companies_found") or 0)
+    found = int(info.get("companies_found") or companies_total or 0)
     active = int(info.get("pipelines_active") or 0)
     pipeline_total = int(info.get("pipelines_total") or 0)
     zips_used = int(info.get("zips_used") or 0)
@@ -172,6 +188,7 @@ def render_progress(
     pages = int(info.get("pages_fetched") or 0)
     requests = int(info.get("requests_made") or 0)
     round_number = int(info.get("redistribution_round") or 0)
+    reviews = int(info.get("with_reviews") or with_reviews or 0)
 
     if total_target:
         fraction = min(found / total_target, 1.0)
@@ -191,6 +208,7 @@ def render_progress(
     kpi_pipelines.metric("Active pipelines", f"{active} / {pipeline_total}")
     kpi_zips.metric("ZIP codes used", f"{zips_used:,} / {zips_total:,}")
     kpi_pages.metric("Pages / requests", f"{pages:,} / {requests:,}")
+    kpi_reviews.metric("With review count", f"{reviews:,}")
 
     pipeline_df = pipelines_to_df(info.get("pipelines") or [])
     if pipeline_df.empty:
@@ -209,10 +227,6 @@ def render_progress(
                 ),
             },
         )
-
-    results_df = companies_to_df(results)
-    if not results_df.empty:
-        results_slot.dataframe(results_df, hide_index=True, width="stretch")
 
     if logs:
         log_slot.code("\n".join(logs[-300:]))
@@ -234,32 +248,43 @@ def run_worker(config: dict, run_state: RunState) -> None:
             use_proxies=config["use_proxies"],
             proxy_targeting=config["proxy_targeting"],
             proxy_mode=config["proxy_mode"],
-            max_parallel_pipelines=config["max_parallel"],
+            max_discovery_workers=config.get("max_discovery_workers", 0),
             on_progress=make_progress_callback(run_state),
             should_stop=run_state.stop_event.is_set,
         )
         companies = runner.run()
-        company_rows = [
+        total = len(companies)
+        preview = [
             company.to_dict() if hasattr(company, "to_dict") else company
-            for company in companies
+            for company in companies[-UI_PREVIEW_ROWS:]
         ]
+        csv_path = xlsx_path = None
+        if companies:
+            csv_path = runner.export_csv()
+            xlsx_path = runner.export_excel()
         with run_state.lock:
-            run_state.results = company_rows
+            run_state.results = preview
+            run_state.companies_total = total
+            run_state.with_reviews = runner.store.with_reviews_count()
+            run_state.csv_path = str(csv_path) if csv_path else ""
+            run_state.xlsx_path = str(xlsx_path) if xlsx_path else ""
+            files_note = ""
+            if csv_path:
+                files_note = f" Saved as {csv_path.name}"
+                if xlsx_path:
+                    files_note += f" and {xlsx_path.name}."
             if run_state.stop_event.is_set():
                 run_state.run_message = (
-                    f"Stopped early with {len(company_rows):,} unique companies."
+                    f"Stopped early with {total:,} unique companies.{files_note}"
                 )
-            elif config["limit"] and len(company_rows) < config["limit"]:
+            elif config["limit"] and total < config["limit"]:
                 run_state.run_message = (
-                    f"Capacity exhausted: collected {len(company_rows):,} of "
-                    f"{config['limit']:,} requested companies."
+                    f"Capacity exhausted: collected {total:,} of "
+                    f"{config['limit']:,} requested companies.{files_note}"
                 )
-            elif company_rows:
-                csv_path = runner.export_csv()
-                xlsx_path = runner.export_excel()
+            elif total:
                 run_state.run_message = (
-                    f"Collected {len(company_rows):,} unique companies. "
-                    f"Saved as {csv_path.name} and {xlsx_path.name}."
+                    f"Collected {total:,} unique companies.{files_note}"
                 )
             else:
                 run_state.run_message = (
@@ -279,8 +304,8 @@ run_state = get_run_state()
 
 st.title("Maps company scraper")
 st.caption(
-    "Concurrent state pipelines with hierarchical quotas, global deduplication, "
-    "deep ZIP pagination, and automatic shortfall redistribution."
+    "Pipelines discover companies in parallel from the Maps search API. "
+    "The table shows a preview only — full results are written to disk."
 )
 
 with st.sidebar:
@@ -290,6 +315,7 @@ with st.sidebar:
         placeholder="IT companies, plumber, web design…",
         key="search_term",
     )
+    st.caption("Whatever you type is sent to Maps as-is (plus the ZIP).")
 
     st.subheader("Location filters")
     countries = st.multiselect(
@@ -305,9 +331,8 @@ with st.sidebar:
         options=city_options,
         key="cities",
         help=(
-            "Optional. Cities narrow ZIPs inside a state when they match. "
-            "States without a matching city still keep their full ZIP pool "
-            "and equal quota share."
+            "Optional. Leave empty to auto-split the selected state(s) into "
+            "pipelines. Country-only runs auto-split by quota / per-ZIP."
         ),
     )
 
@@ -318,9 +343,9 @@ with st.sidebar:
         value=50,
         step=10,
         help=(
-            "0 means unlimited. A positive target is divided evenly across "
-            "selected states. Unmet quota is transferred to pipelines that "
-            "still have ZIP capacity."
+            "0 means unlimited. A positive target is divided across auto "
+            "state/city pipelines (or your selected cities). Unmet quota is "
+            "redistributed to pipelines that still have ZIP capacity."
         ),
         key="limit",
     )
@@ -330,22 +355,59 @@ with st.sidebar:
         max_value=PAGE_SIZE * MAX_PAGES_PER_ZIP,
         value=DEFAULT_PER_ZIP_CAP,
         help=(
-            "Normal pass target per ZIP. If a location remains below quota after "
-            "all ZIPs are tried, the deep pass revisits every ZIP and paginates "
-            f"up to {MAX_PAGES_PER_ZIP} pages."
+            "Normal pass target per ZIP. Maps returns ~20 per page, so 50 means "
+            "paginate ~3 pages on the same sticky IP before moving to the next ZIP. "
+            f"Deep pass can go up to {MAX_PAGES_PER_ZIP} pages if quota is still short."
         ),
         key="per_zip_cap",
     )
 
     st.subheader("Parallelism and pacing")
-    max_parallel = st.number_input(
-        "Maximum parallel pipelines",
-        min_value=1,
-        max_value=16,
-        value=4,
-        help="Each selected state runs as an independent worker, up to this limit.",
-        key="max_parallel",
+    auto_parallel = st.toggle(
+        "Auto parallelism from company target",
+        value=True,
+        key="auto_parallel",
+        help=(
+            "Plans pipelines ≈ total ÷ results-per-ZIP (same math for country "
+            "or selected states). Concurrent workers follow that plan, capped at "
+            f"{MAX_DISCOVERY_WORKERS}. Extra planned pipelines wait in queue. "
+            "Turn off to lower concurrent workers on a weaker machine."
+        ),
     )
+    plan_preview = preview_pipeline_plan(
+        limit=int(limit),
+        countries=countries or None,
+        states=states or None,
+        cities=cities or None,
+        per_zip_cap=int(per_zip_cap),
+    )
+    auto_disc = auto_discovery_workers(
+        int(limit),
+        len(plan_preview),
+        per_zip_cap=int(per_zip_cap),
+    )
+    if auto_parallel:
+        max_discovery = 0
+        st.caption(
+            f"Plan {len(plan_preview)} pipeline(s) · concurrent ×{auto_disc} "
+            f"(max {MAX_DISCOVERY_WORKERS})"
+        )
+    else:
+        max_discovery = st.number_input(
+            "Max concurrent discovery workers",
+            min_value=1,
+            max_value=MAX_DISCOVERY_WORKERS,
+            value=min(4, max(1, len(plan_preview) or 1)),
+            help=(
+                f"How many pipelines run at once (1–{MAX_DISCOVERY_WORKERS}). "
+                f"Plan still has {len(plan_preview)} pipeline(s); extras queue."
+            ),
+            key="max_discovery",
+        )
+        st.caption(
+            f"Plan {len(plan_preview)} pipeline(s) · concurrent ×{int(max_discovery)} "
+            f"(max {MAX_DISCOVERY_WORKERS})"
+        )
     delay_min = st.number_input(
         "Minimum delay between ZIPs (seconds)",
         min_value=0.5,
@@ -430,21 +492,22 @@ with st.sidebar:
             key="proxy_text",
         )
 
-    plan = preview_pipeline_plan(
-        limit=int(limit),
-        countries=countries or None,
-        states=states or None,
-        cities=cities or None,
-    )
+    plan = plan_preview
     if plan:
-        st.caption(
-            f"Plan: {len(plan)} state pipeline(s) · "
-            + ", ".join(f"{row['state']}={row['quota']}" for row in plan)
+        sample = ", ".join(
+            f"{row.get('label') or row.get('state')}={row['quota']}" for row in plan[:8]
         )
-        if int(max_parallel) < len(plan):
+        st.caption(
+            f"Plan: {len(plan)} city/state pipeline(s) · {sample}"
+            + ("…" if len(plan) > 8 else "")
+        )
+        effective_disc = (
+            auto_disc if auto_parallel else int(max_discovery)
+        )
+        if effective_disc < len(plan):
             st.caption(
-                f"Note: only {int(max_parallel)} of {len(plan)} pipelines can run "
-                "at once with the current parallel limit."
+                f"Note: only {effective_disc} of {len(plan)} pipelines run at once; "
+                "others queue."
             )
 
     snapshot = run_state.snapshot()
@@ -467,25 +530,28 @@ with st.container(border=True):
     status_heading = st.empty()
     overall_progress = st.progress(0.0, text="Ready")
 
-kpi_columns = st.columns(4, border=True)
+kpi_columns = st.columns(5, border=True)
 kpi_companies = kpi_columns[0].empty()
 kpi_pipelines = kpi_columns[1].empty()
 kpi_zips = kpi_columns[2].empty()
 kpi_pages = kpi_columns[3].empty()
+kpi_reviews = kpi_columns[4].empty()
 
 pipeline_container = st.container(border=True)
 with pipeline_container:
     st.subheader("Parallel pipeline activity")
     st.caption(
-        "Each row is an independent state worker. Deep scan means the normal ZIP "
-        "pass was insufficient and additional pages are being fetched."
+        "Each row is a discovery worker. Deep scan paginates further when the "
+        "normal ZIP pass is short of quota."
     )
     pipeline_slot = st.empty()
 
 results_container = st.container(border=True)
 with results_container:
     st.subheader("Companies")
+    results_caption = st.empty()
     results_slot = st.empty()
+    download_slot = st.empty()
 
 with st.expander("Run log", icon=":material/receipt_long:"):
     log_slot = st.empty()
@@ -504,6 +570,10 @@ if start and search_term.strip() and not snapshot["running"]:
             run_state.running = True
             run_state.stop_event.clear()
             run_state.results = []
+            run_state.companies_total = 0
+            run_state.with_reviews = 0
+            run_state.csv_path = ""
+            run_state.xlsx_path = ""
             run_state.logs = []
             run_state.progress = {}
             run_state.run_error = ""
@@ -528,7 +598,7 @@ if start and search_term.strip() and not snapshot["running"]:
             "use_proxies": use_proxies,
             "proxy_targeting": proxy_targeting if use_proxies else None,
             "proxy_mode": proxy_mode if use_proxies else None,
-            "max_parallel": int(max_parallel),
+            "max_discovery_workers": 0 if auto_parallel else int(max_discovery),
         }
         thread = threading.Thread(
             target=run_worker,
@@ -538,13 +608,28 @@ if start and search_term.strip() and not snapshot["running"]:
         )
         run_state.worker = thread
         thread.start()
+        disc = auto_disc if auto_parallel else int(max_discovery)
         run_state.append_log(
-            f"Queued scrape for {len(plan)} state pipeline(s) "
-            f"(max parallel {int(max_parallel)})."
+            f"Queued scrape for {len(plan)} pipeline(s) · discovery×{disc}."
         )
         st.rerun()
 
 snapshot = run_state.snapshot()
+
+def _show_results_preview(snap: dict) -> None:
+    preview_df = companies_to_df(snap["results"])
+    total = int(snap["companies_total"] or len(preview_df))
+    if preview_df.empty:
+        if not snap["running"]:
+            results_caption.empty()
+            results_slot.info("Results will appear here during a run.")
+        return
+    results_caption.caption(
+        f"Showing latest {len(preview_df):,} of {total:,} "
+        f"(full export under `{OUTPUT_DIR.name}/`)"
+    )
+    results_slot.dataframe(preview_df, hide_index=True, width="stretch")
+
 
 if snapshot["running"]:
     info = snapshot["progress"]
@@ -554,12 +639,15 @@ if snapshot["running"]:
             total_target=int(limit),
             results=snapshot["results"],
             logs=snapshot["logs"],
+            companies_total=snapshot["companies_total"],
+            with_reviews=snapshot["with_reviews"],
         )
     else:
         status_heading.markdown("**Starting pipelines…**")
         if snapshot["logs"]:
             log_slot.code("\n".join(snapshot["logs"][-300:]))
-    time.sleep(0.8)
+    _show_results_preview(snapshot)
+    time.sleep(1.2)
     st.rerun()
 
 info = snapshot["progress"]
@@ -569,6 +657,8 @@ if info:
         total_target=int(limit),
         results=snapshot["results"],
         logs=snapshot["logs"],
+        companies_total=snapshot["companies_total"],
+        with_reviews=snapshot["with_reviews"],
     )
 else:
     status_heading.markdown("**Ready**")
@@ -576,31 +666,31 @@ else:
     kpi_pipelines.metric("Active pipelines", "0 / 0")
     kpi_zips.metric("ZIP codes used", "0 / 0")
     kpi_pages.metric("Pages / requests", "0 / 0")
+    kpi_reviews.metric("With review count", "0")
     pipeline_slot.info("Pipelines will appear after the run starts.")
 
-results_df = companies_to_df(snapshot["results"])
-if not results_df.empty:
-    results_slot.dataframe(results_df, hide_index=True, width="stretch")
-    download_row = st.container(horizontal=True)
-    with download_row:
-        st.download_button(
-            "Download CSV",
-            data=results_df.to_csv(index=False).encode("utf-8"),
-            file_name=f"maps_results_{int(time.time())}.csv",
-            mime="text/csv",
-            icon=":material/download:",
-        )
-        excel_buffer = BytesIO()
-        results_df.to_excel(excel_buffer, index=False)
-        st.download_button(
-            "Download Excel",
-            data=excel_buffer.getvalue(),
-            file_name=f"maps_results_{int(time.time())}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            icon=":material/download:",
-        )
-elif not snapshot["running"]:
-    results_slot.info("Results will appear here during a run.")
+_show_results_preview(snapshot)
+
+csv_path = Path(snapshot["csv_path"]) if snapshot["csv_path"] else None
+xlsx_path = Path(snapshot["xlsx_path"]) if snapshot["xlsx_path"] else None
+if not snapshot["running"] and (csv_path or xlsx_path):
+    with download_slot.container(horizontal=True):
+        if csv_path and csv_path.is_file():
+            st.download_button(
+                "Download CSV",
+                data=csv_path.read_bytes(),
+                file_name=csv_path.name,
+                mime="text/csv",
+                icon=":material/download:",
+            )
+        if xlsx_path and xlsx_path.is_file():
+            st.download_button(
+                "Download Excel",
+                data=xlsx_path.read_bytes(),
+                file_name=xlsx_path.name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                icon=":material/download:",
+            )
 
 if snapshot["run_error"]:
     st.error(snapshot["run_error"], icon=":material/error:")
@@ -610,5 +700,5 @@ elif snapshot["run_message"] and not snapshot["running"]:
     else:
         st.success(snapshot["run_message"], icon=":material/check_circle:")
 
-if snapshot["logs"]:
+if snapshot["logs"] and not snapshot["running"]:
     log_slot.code("\n".join(snapshot["logs"][-300:]))

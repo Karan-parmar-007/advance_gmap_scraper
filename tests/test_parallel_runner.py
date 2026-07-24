@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from scraper.dedupe import DedupeStore
 from scraper.locations import ZipLocation
 from scraper.models import Company
-from scraper.quotas import GeoUnit
+from scraper.quotas import GeoUnit, build_scrape_units
 from scraper.runner import (
     LocationProgress,
     PipelineProgress,
@@ -23,6 +23,7 @@ def make_pipeline(name: str, target: int) -> PipelineProgress:
         label=name,
         country="United States",
         state=name,
+        city="",
         locations=[],
         target=target,
     )
@@ -51,7 +52,8 @@ class CapacityRunner(ScraperRunner):
             )
             for index in range(start, start + count)
         ]
-        added = self.store.add_many(companies, max_total=self.limit)
+        accepted = self.store.add_many(companies, max_total=self.limit)
+        added = len(accepted)
         with pipeline.lock:
             pipeline.collected += added
             pipeline.exhausted = pipeline.collected >= capacity
@@ -128,7 +130,7 @@ def test_dedupe_store_is_thread_safe() -> None:
     assert len(store) == 100
 
 
-def test_units_group_into_one_pipeline_per_state() -> None:
+def test_units_become_one_pipeline_per_city() -> None:
     runner = ScraperRunner(
         search_term="test",
         countries=["United States"],
@@ -136,8 +138,6 @@ def test_units_group_into_one_pipeline_per_state() -> None:
         cities=["Chicago", "Boston"],
         limit=600,
     )
-    from scraper.quotas import build_scrape_units
-
     units = build_scrape_units(
         limit=600,
         countries=runner.countries,
@@ -147,10 +147,7 @@ def test_units_group_into_one_pipeline_per_state() -> None:
     pipelines = runner._build_pipelines(units)
 
     assert len(pipelines) == 2
-    assert {pipeline.state for pipeline in pipelines} == {
-        "Illinois",
-        "Massachusetts",
-    }
+    assert {pipeline.city for pipeline in pipelines} == {"Chicago", "Boston"}
     assert {pipeline.target for pipeline in pipelines} == {300}
 
 
@@ -158,5 +155,5 @@ if __name__ == "__main__":
     test_shortfall_moves_to_pipeline_with_capacity()
     test_deep_scan_revisits_zip_after_normal_cap()
     test_dedupe_store_is_thread_safe()
-    test_units_group_into_one_pipeline_per_state()
+    test_units_become_one_pipeline_per_city()
     print("All parallel runner tests passed.")

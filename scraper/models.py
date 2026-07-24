@@ -26,7 +26,8 @@ class Company:
     longitude: float | None = None
     place_id: str = ""
     kg_mid: str = ""
-    hours_text: str = ""
+    timezone: str = ""
+    cid: str = ""
     search_term: str = ""
     search_zip: str = ""
     search_city: str = ""
